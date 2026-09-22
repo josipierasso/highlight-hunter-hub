@@ -308,7 +308,7 @@ function Index() {
                   max={15}
                   step={1}
                   disabled={busy}
-                  onValueChange={([v]) => setTargetCount(v)}
+                  onValueChange={([v]) => setTargetCount(v ?? targetCount)}
                 />
               </div>
 
@@ -366,7 +366,7 @@ function Index() {
                   <div className="max-w-2xl">
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge className="bg-primary/15 text-primary hover:bg-primary/20">
-                        {CATEGORY_LABEL[clip.category] ?? CATEGORY_LABEL.outro}
+                        {CATEGORY_LABEL[clip.category] ?? CATEGORY_LABEL["outro"]}
                       </Badge>
                       <span className="text-sm text-muted-foreground">
                         {formatTime(clip.start)} → {formatTime(clip.end)} ·{" "}
