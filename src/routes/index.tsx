@@ -18,11 +18,14 @@ import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
 import { Toaster } from "@/components/ui/sonner";
 import {
-  cutClip,
-  extractAudioChunks,
-  extractFrames,
-  getVideoDuration,
-} from "@/lib/video-engine";
+  finalizeClips,
+  generateClipCandidates,
+  mergeChunkTranscripts,
+  selectCandidatesForAnalysis,
+  type Clip,
+  type TranscriptionResult,
+} from "@/lib/clip-engine";
+import { cutClip, extractAudioChunks, extractFrames, getVideoDuration } from "@/lib/video-engine";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -45,16 +48,6 @@ export const Route = createFileRoute("/")({
   }),
   component: Index,
 });
-
-type Clip = {
-  title: string;
-  start: number;
-  end: number;
-  category: string;
-  reason: string;
-  hook: string;
-  score: number;
-};
 
 type Stage = "idle" | "audio" | "transcribing" | "frames" | "analyzing" | "done";
 
@@ -131,7 +124,7 @@ function Index() {
 
       setStage("transcribing");
       setStatusText("Ouvindo o vídeo e escrevendo o que é falado...");
-      const segments: Array<{ start: number; end: number; text: string }> = [];
+      const transcribed: Array<{ start: number; end: number; payload: TranscriptionResult }> = [];
       const concurrency = 3;
       let done = 0;
       for (let i = 0; i < chunks.length; i += concurrency) {
@@ -145,14 +138,26 @@ function Index() {
               const info = (await res.json().catch(() => ({}))) as { error?: string };
               throw new Error(info.error || "Falha ao transcrever um trecho.");
             }
-            const data = (await res.json()) as { text: string };
-            return { start: chunk.start, end: chunk.end, text: data.text };
+            const data = (await res.json()) as Partial<TranscriptionResult>;
+            return {
+              start: chunk.start,
+              end: chunk.end,
+              payload: {
+                text: data.text ?? "",
+                segments: data.segments ?? [],
+                words: data.words ?? [],
+              },
+            };
           }),
         );
-        for (const r of results) if (r.text) segments.push(r);
+        transcribed.push(...results);
         done += batch.length;
         setProgress(Math.round((done / chunks.length) * 100));
       }
+
+      const segments = mergeChunkTranscripts(transcribed, duration);
+      const pool = generateClipCandidates(segments, duration);
+      const candidates = selectCandidatesForAnalysis(pool, targetCount);
 
       setStage("frames");
       setStatusText("Olhando as cenas do vídeo...");
@@ -172,7 +177,8 @@ function Index() {
         body: JSON.stringify({
           duration,
           targetCount,
-          segments: segments.sort((a, b) => a.start - b.start),
+          segments,
+          candidates: candidates.map(({ start, end, text }) => ({ start, end, text })),
           frames,
         }),
       });
@@ -181,10 +187,7 @@ function Index() {
         throw new Error(info.error || "A análise falhou.");
       }
       const plan = (await res.json()) as { overview: string; clips: Clip[] };
-      const valid = (plan.clips || [])
-        .filter((c) => c.end > c.start && c.end - c.start >= 8 && c.start < duration)
-        .map((c) => ({ ...c, end: Math.min(c.end, duration) }))
-        .sort((a, b) => b.score - a.score);
+      const valid = finalizeClips(plan.clips || [], candidates, duration, targetCount);
       setOverview(plan.overview || "");
       setClips(valid);
       setStage("done");
@@ -313,7 +316,11 @@ function Index() {
               </div>
 
               <Button size="lg" onClick={analyze} disabled={busy} className="w-full md:w-fit">
-                {busy ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
+                {busy ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Sparkles className="size-4" />
+                )}
                 {busy ? "Analisando..." : "Analisar e separar os melhores cortes"}
               </Button>
 

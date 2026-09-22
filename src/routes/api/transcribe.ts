@@ -1,8 +1,34 @@
 import { createFileRoute } from "@tanstack/react-router";
 
+import { parseTranscriptionPayload, type TranscriptionResult } from "@/lib/clip-engine";
+
 const GATEWAY = "https://ai.gateway.lovable.dev/v1";
 const MODEL = "openai/gpt-4o-mini-transcribe";
 const MAX_BYTES = 24 * 1024 * 1024;
+
+async function requestTranscription(
+  key: string,
+  file: File,
+  format: "verbose_json" | "json",
+): Promise<{ ok: boolean; status: number; body: string }> {
+  const form = new FormData();
+  form.append("model", MODEL);
+  form.append("response_format", format);
+  form.append("file", file, file.name || "chunk.mp3");
+
+  const res = await fetch(`${GATEWAY}/audio/transcriptions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}` },
+    body: form,
+  });
+
+  const body = await res.text().catch(() => "");
+  return { ok: res.ok, status: res.status, body };
+}
+
+function hasTimedSpeech(result: TranscriptionResult) {
+  return result.segments.some((segment) => segment.end > segment.start) || result.words.length > 0;
+}
 
 export const Route = createFileRoute("/api/transcribe")({
   server: {
@@ -19,53 +45,29 @@ export const Route = createFileRoute("/api/transcribe")({
           return Response.json({ error: "Trecho de áudio inválido." }, { status: 400 });
         }
 
-        const form = new FormData();
-        form.append("model", MODEL);
-        form.append("response_format", "json");
-        form.append("stream", "true");
-        form.append("file", file, file.name || "chunk.mp3");
+        const verbose = await requestTranscription(key, file, "verbose_json");
+        let parsed = parseTranscriptionPayload(verbose.body);
 
-        const res = await fetch(`${GATEWAY}/audio/transcriptions`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${key}` },
-          body: form,
+        if (!verbose.ok) {
+          const plain = await requestTranscription(key, file, "json");
+          if (!plain.ok) {
+            return Response.json(
+              { error: plain.body || verbose.body || "Falha ao transcrever o áudio." },
+              { status: plain.status || verbose.status || 502 },
+            );
+          }
+          parsed = parseTranscriptionPayload(plain.body);
+        }
+
+        if (!parsed.text && !hasTimedSpeech(parsed)) {
+          return Response.json({ text: "", segments: [], words: [] });
+        }
+
+        return Response.json({
+          text: parsed.text.trim(),
+          segments: parsed.segments,
+          words: parsed.words,
         });
-
-        if (!res.ok || !res.body) {
-          const detail = await res.text().catch(() => "");
-          return Response.json(
-            { error: detail || "Falha ao transcrever o áudio." },
-            { status: res.status || 502 },
-          );
-        }
-
-        const raw = await res.text();
-        let text = "";
-        for (const line of raw.split("\n")) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("data:")) continue;
-          const payload = trimmed.slice(5).trim();
-          if (!payload || payload === "[DONE]") continue;
-          try {
-            const evt = JSON.parse(payload) as { delta?: string; text?: string; type?: string };
-            if (typeof evt.delta === "string") text += evt.delta;
-            else if (evt.type?.endsWith("done") && typeof evt.text === "string") text = evt.text;
-            else if (!evt.type && typeof evt.text === "string") text = evt.text;
-          } catch {
-            // ignore malformed keep-alive lines
-          }
-        }
-
-        if (!text.trim()) {
-          try {
-            const parsed = JSON.parse(raw) as { text?: string };
-            if (parsed.text) text = parsed.text;
-          } catch {
-            // no-op
-          }
-        }
-
-        return Response.json({ text: text.trim() });
       },
     },
   },

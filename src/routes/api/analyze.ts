@@ -9,7 +9,12 @@ const BodySchema = z.object({
   targetCount: z.number().min(1).max(20).default(8),
   segments: z
     .array(z.object({ start: z.number(), end: z.number(), text: z.string() }))
-    .max(400),
+    .max(400)
+    .default([]),
+  candidates: z
+    .array(z.object({ start: z.number(), end: z.number(), text: z.string() }))
+    .max(40)
+    .default([]),
   frames: z.array(z.object({ time: z.number(), dataUrl: z.string() })).max(40),
 });
 
@@ -24,7 +29,7 @@ const clipSchema = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["title", "start", "end", "category", "reason", "score", "hook"],
+        required: ["title", "start", "end", "category", "reason", "score", "hook", "scores"],
         properties: {
           title: { type: "string" },
           start: { type: "number" },
@@ -36,11 +41,27 @@ const clipSchema = {
           reason: { type: "string" },
           hook: { type: "string" },
           score: { type: "number" },
+          scores: {
+            type: "object",
+            additionalProperties: false,
+            required: ["hook", "curiosity", "clarity", "emotion", "standalone"],
+            properties: {
+              hook: { type: "number" },
+              curiosity: { type: "number" },
+              clarity: { type: "number" },
+              emotion: { type: "number" },
+              standalone: { type: "number" },
+            },
+          },
         },
       },
     },
   },
 } as const;
+
+function formatWindow(start: number, end: number, text: string) {
+  return `[${start.toFixed(1)}s-${end.toFixed(1)}s] ${text}`;
+}
 
 export const Route = createFileRoute("/api/analyze")({
   server: {
@@ -52,9 +73,15 @@ export const Route = createFileRoute("/api/analyze")({
         }
 
         const body = BodySchema.parse(await request.json());
-
+        const pools = body.candidates.length ? body.candidates : body.segments;
         const transcript = body.segments
-          .map((s) => `[${s.start.toFixed(0)}s-${s.end.toFixed(0)}s] ${s.text}`)
+          .map((segment) => formatWindow(segment.start, segment.end, segment.text))
+          .join("\n");
+        const candidateBlock = pools
+          .map(
+            (candidate, index) =>
+              `${index + 1}. ${formatWindow(candidate.start, candidate.end, candidate.text)}`,
+          )
           .join("\n");
 
         const content: Array<Record<string, unknown>> = [
@@ -64,8 +91,12 @@ export const Route = createFileRoute("/api/analyze")({
               `Duração total do vídeo: ${body.duration.toFixed(0)} segundos.`,
               `Quantidade desejada de clipes: ${body.targetCount}.`,
               "",
-              "Transcrição com marcas de tempo aproximadas:",
+              "Transcrição com timestamps reais da fala:",
               transcript || "(sem fala detectada — use apenas os quadros de imagem)",
+              "",
+              "Candidatos já recortados em frases. Escolha somente entre eles.",
+              "Copie start e end do candidato. Não invente novos tempos.",
+              candidateBlock || "(nenhum candidato — devolva lista vazia de clips)",
               "",
               "A seguir, quadros do vídeo com o tempo indicado.",
             ].join("\n"),
@@ -78,13 +109,15 @@ export const Route = createFileRoute("/api/analyze")({
         }
 
         const instructions = [
-          "Você é um editor profissional de cortes virais. Antes de escolher, estude o vídeo inteiro:",
-          "identifique o assunto, o ritmo, onde a tensão sobe e onde há começo-meio-fim.",
-          "Selecione somente momentos autossuficientes: luta/ação, clímax, discussões e brigas de opinião,",
-          "explicações completas de estudo e picos de apresentações/palestras.",
-          "Regras: cada clipe entre 15 e 60 segundos; comece 1-2s antes do gancho e termine num ponto de fechamento;",
-          "não escolha trechos sobrepostos; ordene por potencial (score de 0 a 100);",
-          "descarte introduções, enrolação, silêncio e repetição, mesmo que sobrem menos clipes que o pedido.",
+          "Você é um editor profissional de cortes virais. Estude o vídeo e ranqueie os candidatos.",
+          "Cada Short precisa ser standalone: quem nunca viu o vídeo inteiro tem de entender o assunto,",
+          "sentir um gancho no começo e um fechamento no fim, sem depender de contexto dito muito antes.",
+          "Um trecho emocionante que exige contexto anterior deve receber standalone baixo.",
+          "Avalie scores 0-100: hook, curiosity, clarity, emotion, standalone.",
+          "score geral deve refletir o potencial como Short, penalizando standalone abaixo de 50.",
+          "Regras: use start/end exatamente de um candidato; 15 a 90 segundos; sem duplicatas quase iguais;",
+          "prefira 15-60s quando houver opção; descarte enrolação, silêncio e repetição;",
+          "mesmo que sobrem menos clipes que o pedido.",
           "Escreva títulos e justificativas em português do Brasil. 'hook' é a primeira frase falada do clipe.",
         ].join(" ");
 
