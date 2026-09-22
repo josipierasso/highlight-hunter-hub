@@ -25,7 +25,7 @@ export const Route = createFileRoute("/api/transcribe")({
         form.append("stream", "true");
         form.append("file", file, file.name || "chunk.mp3");
 
-        const res = await fetch(`${GATEWAY}/v1/audio/transcriptions`.replace("/v1/v1", "/v1"), {
+        const res = await fetch(`${GATEWAY}/audio/transcriptions`, {
           method: "POST",
           headers: { Authorization: `Bearer ${key}` },
           body: form,
