@@ -6,8 +6,11 @@ import {
   computeOverallScore,
   dedupeByOverlap,
   finalizeClips,
+  formatBytes,
+  formatClock,
   generateClipCandidates,
   intervalIoU,
+  isFiniteDuration,
   mergeChunkTranscripts,
   MIN_CLIP_SECONDS,
   MAX_CLIP_SECONDS,
@@ -364,5 +367,44 @@ describe("dedupe and score", () => {
   it("measures overlap of 10-45 vs 15-48 as a duplicate", () => {
     assert.ok(overlapRatio({ start: 10, end: 45 }, { start: 15, end: 48 }) > 0.7);
     assert.ok(intervalIoU({ start: 10, end: 45 }, { start: 15, end: 48 }) > 0.6);
+  });
+});
+
+describe("invalid media metadata", () => {
+  it("does not format Infinity or NaN as a clock", () => {
+    assert.equal(formatClock(Infinity), "—");
+    assert.equal(formatClock(Number.NaN), "—");
+    assert.equal(isFiniteDuration(Infinity), false);
+    assert.equal(isFiniteDuration(Number.NaN), false);
+    assert.equal(formatClock(77.8), "01:18");
+  });
+
+  it("does not round small files to 0 MB", () => {
+    assert.equal(formatBytes(0), "0 B");
+    assert.equal(formatBytes(512), "512 B");
+    assert.equal(formatBytes(20 * 1024), "20 KB");
+    assert.equal(formatBytes(1.4 * 1024 * 1024), "1.4 MB");
+    assert.equal(formatBytes(400 * 1024), "400 KB");
+  });
+
+  it("JSON.stringify turns Infinity duration into null, which analyze must reject", () => {
+    const payload = JSON.parse(JSON.stringify({ duration: Infinity })) as { duration: unknown };
+    assert.equal(payload.duration, null);
+    assert.equal(typeof payload.duration === "number" && Number.isFinite(payload.duration), false);
+  });
+
+  it("still builds candidates when duration is known and speech is finite", () => {
+    const candidates = generateClipCandidates(
+      [
+        speech(10, 20, "gancho claro desta aula de matemática para fechar a ideia"),
+        speech(20, 32, "o payoff mostra a prova completa agora"),
+      ],
+      40,
+    );
+    assert.ok(candidates.length >= 1);
+    for (const candidate of candidates) {
+      assert.equal(Number.isFinite(candidate.start), true);
+      assert.equal(Number.isFinite(candidate.end), true);
+    }
   });
 });

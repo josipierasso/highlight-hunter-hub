@@ -47,16 +47,34 @@ export const Route = createFileRoute("/api/transcribe")({
 
         const verbose = await requestTranscription(key, file, "verbose_json");
         let parsed = parseTranscriptionPayload(verbose.body);
+        console.info("[transcribe]", {
+          format: "verbose_json",
+          ok: verbose.ok,
+          status: verbose.status,
+          bytes: file.size,
+          textChars: parsed.text.length,
+          segments: parsed.segments.length,
+          words: parsed.words.length,
+        });
 
         if (!verbose.ok) {
           const plain = await requestTranscription(key, file, "json");
+          parsed = parseTranscriptionPayload(plain.body);
+          console.info("[transcribe]", {
+            format: "json",
+            ok: plain.ok,
+            status: plain.status,
+            bytes: file.size,
+            textChars: parsed.text.length,
+            segments: parsed.segments.length,
+            words: parsed.words.length,
+          });
           if (!plain.ok) {
             return Response.json(
               { error: plain.body || verbose.body || "Falha ao transcrever o áudio." },
               { status: plain.status || verbose.status || 502 },
             );
           }
-          parsed = parseTranscriptionPayload(plain.body);
         }
 
         if (!parsed.text && !hasTimedSpeech(parsed)) {

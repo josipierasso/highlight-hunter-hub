@@ -19,7 +19,10 @@ import { Slider } from "@/components/ui/slider";
 import { Toaster } from "@/components/ui/sonner";
 import {
   finalizeClips,
+  formatBytes,
+  formatClock,
   generateClipCandidates,
+  isFiniteDuration,
   mergeChunkTranscripts,
   selectCandidatesForAnalysis,
   type Clip,
@@ -64,10 +67,39 @@ const CHUNK_SECONDS = 90;
 const MAX_FRAMES = 30;
 
 function formatTime(seconds: number) {
-  const s = Math.max(0, Math.round(seconds));
-  const m = Math.floor(s / 60);
-  const rest = s % 60;
-  return `${String(m).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
+  return formatClock(seconds);
+}
+
+class AnalysisError extends Error {
+  stage: Stage;
+  constructor(stage: Stage, message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.stage = stage;
+  }
+}
+
+function stageLabelForError(stage: Stage) {
+  switch (stage) {
+    case "audio":
+      return "extração de áudio";
+    case "transcribing":
+      return "transcrição";
+    case "frames":
+      return "leitura das cenas";
+    case "analyzing":
+      return "análise dos cortes";
+    default:
+      return "análise";
+  }
+}
+
+function logStageFailure(stage: Stage, error: unknown, extra?: Record<string, unknown>) {
+  console.error("[clip-engine]", {
+    stage,
+    error: error instanceof Error ? error.message : String(error),
+    cause: error instanceof Error ? error.cause : undefined,
+    ...extra,
+  });
 }
 
 function Index() {
@@ -101,27 +133,57 @@ function Index() {
     setOverview("");
     setStage("idle");
     setProgress(0);
+    setDuration(0);
+    setFile(picked);
+    setStatusText("Calculando duração...");
     try {
       const dur = await getVideoDuration(picked);
-      setFile(picked);
+      if (!isFiniteDuration(dur)) {
+        throw new Error("Duração inválida.");
+      }
       setDuration(dur);
       setTargetCount(Math.max(3, Math.min(12, Math.round(dur / 300) + 3)));
-    } catch {
-      toast.error("Não conseguimos abrir esse vídeo. Use MP4, MOV ou WEBM.");
+      setStatusText("");
+    } catch (error) {
+      logStageFailure("idle", error, {
+        name: picked.name,
+        type: picked.type,
+        size: picked.size,
+      });
+      setFile(null);
+      setDuration(0);
+      setStatusText("");
+      toast.error("Não conseguimos ler a duração deste vídeo. Use MP4, MOV ou WEBM.");
     }
   }, []);
 
   const analyze = useCallback(async () => {
     if (!file) return;
+    let current: Stage = "audio";
     try {
+      if (!isFiniteDuration(duration)) {
+        throw new AnalysisError(
+          "idle",
+          "A duração deste vídeo ainda não foi calculada. Troque o arquivo e tente de novo.",
+        );
+      }
+
       setStage("audio");
       setStatusText("Separando o áudio do vídeo no seu computador...");
       setProgress(0);
-      const chunks = await extractAudioChunks(file, CHUNK_SECONDS, (r) =>
-        setProgress(Math.round(r * 100)),
-      );
-      if (!chunks.length) throw new Error("Este vídeo não tem áudio legível.");
+      let chunks;
+      try {
+        chunks = await extractAudioChunks(file, CHUNK_SECONDS, (r) =>
+          setProgress(Math.round(r * 100)),
+        );
+      } catch (error) {
+        throw new AnalysisError("audio", "Não foi possível extrair o áudio deste vídeo.", error);
+      }
+      if (!chunks.length) {
+        throw new AnalysisError("audio", "Este vídeo não tem áudio legível.");
+      }
 
+      current = "transcribing";
       setStage("transcribing");
       setStatusText("Ouvindo o vídeo e escrevendo o que é falado...");
       const transcribed: Array<{ start: number; end: number; payload: TranscriptionResult }> = [];
@@ -134,18 +196,30 @@ function Index() {
             const form = new FormData();
             form.append("file", chunk.blob, "chunk.mp3");
             const res = await fetch("/api/transcribe", { method: "POST", body: form });
+            const info = (await res.json().catch(() => ({}))) as Partial<TranscriptionResult> & {
+              error?: string;
+            };
             if (!res.ok) {
-              const info = (await res.json().catch(() => ({}))) as { error?: string };
-              throw new Error(info.error || "Falha ao transcrever um trecho.");
+              console.error("[clip-engine]", {
+                stage: "transcribing",
+                status: res.status,
+                error: info.error,
+                chunkStart: chunk.start,
+                chunkEnd: chunk.end,
+                chunkBytes: chunk.blob.size,
+              });
+              throw new AnalysisError(
+                "transcribing",
+                info.error || "Falha ao transcrever um trecho.",
+              );
             }
-            const data = (await res.json()) as Partial<TranscriptionResult>;
             return {
               start: chunk.start,
               end: chunk.end,
               payload: {
-                text: data.text ?? "",
-                segments: data.segments ?? [],
-                words: data.words ?? [],
+                text: info.text ?? "",
+                segments: info.segments ?? [],
+                words: info.words ?? [],
               },
             };
           }),
@@ -158,7 +232,16 @@ function Index() {
       const segments = mergeChunkTranscripts(transcribed, duration);
       const pool = generateClipCandidates(segments, duration);
       const candidates = selectCandidatesForAnalysis(pool, targetCount);
+      console.info("[clip-engine]", {
+        stage: "candidates",
+        duration,
+        chunks: chunks.length,
+        segments: segments.length,
+        pool: pool.length,
+        candidates: candidates.length,
+      });
 
+      current = "frames";
       setStage("frames");
       setStatusText("Olhando as cenas do vídeo...");
       setProgress(0);
@@ -166,9 +249,15 @@ function Index() {
       const times = Array.from({ length: count }, (_, i) =>
         Math.round(((i + 0.5) * duration) / count),
       );
-      const frames = await extractFrames(file, times);
+      let frames: Array<{ time: number; dataUrl: string }>;
+      try {
+        frames = await extractFrames(file, times);
+      } catch (error) {
+        throw new AnalysisError("frames", "Não foi possível ler as cenas deste vídeo.", error);
+      }
       setProgress(100);
 
+      current = "analyzing";
       setStage("analyzing");
       setStatusText("Estudando ritmo, clímax e contexto para escolher os cortes...");
       const res = await fetch("/api/analyze", {
@@ -182,19 +271,39 @@ function Index() {
           frames,
         }),
       });
+      const info = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        overview?: string;
+        clips?: Clip[];
+      };
       if (!res.ok) {
-        const info = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(info.error || "A análise falhou.");
+        console.error("[clip-engine]", {
+          stage: "analyzing",
+          status: res.status,
+          error: info.error,
+          duration,
+          candidates: candidates.length,
+          frames: frames.length,
+        });
+        throw new AnalysisError("analyzing", info.error || "A análise falhou.");
       }
-      const plan = (await res.json()) as { overview: string; clips: Clip[] };
-      const valid = finalizeClips(plan.clips || [], candidates, duration, targetCount);
-      setOverview(plan.overview || "");
+      const valid = finalizeClips(info.clips || [], candidates, duration, targetCount);
+      setOverview(info.overview || "");
       setClips(valid);
       setStage("done");
       toast.success(`${valid.length} cortes prontos para baixar.`);
     } catch (error) {
+      const failed = error instanceof AnalysisError ? error.stage : current;
+      logStageFailure(failed, error, {
+        duration,
+        size: file.size,
+        type: file.type,
+        name: file.name,
+      });
       setStage("idle");
-      toast.error(error instanceof Error ? error.message : "Algo deu errado na análise.");
+      toast.error("Não foi possível analisar este vídeo.", {
+        description: `Etapa: ${stageLabelForError(failed)}`,
+      });
     }
   }, [duration, file, targetCount]);
 
@@ -282,7 +391,9 @@ function Index() {
                   <div>
                     <p className="font-medium">{file.name}</p>
                     <p className="text-sm text-muted-foreground">
-                      {formatTime(duration)} · {(file.size / 1024 / 1024).toFixed(0)} MB
+                      {isFiniteDuration(duration)
+                        ? `${formatTime(duration)} · ${formatBytes(file.size)}`
+                        : `Calculando duração... · ${formatBytes(file.size)}`}
                     </p>
                   </div>
                 </div>
@@ -315,7 +426,12 @@ function Index() {
                 />
               </div>
 
-              <Button size="lg" onClick={analyze} disabled={busy} className="w-full md:w-fit">
+              <Button
+                size="lg"
+                onClick={analyze}
+                disabled={busy || !isFiniteDuration(duration)}
+                className="w-full md:w-fit"
+              >
                 {busy ? (
                   <Loader2 className="size-4 animate-spin" />
                 ) : (

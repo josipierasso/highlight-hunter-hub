@@ -5,7 +5,7 @@ const GATEWAY = "https://ai.gateway.lovable.dev/v1/responses";
 const MODEL = "openai/gpt-6-astra";
 
 const BodySchema = z.object({
-  duration: z.number().positive(),
+  duration: z.number().finite().positive(),
   targetCount: z.number().min(1).max(20).default(8),
   segments: z
     .array(z.object({ start: z.number(), end: z.number(), text: z.string() }))

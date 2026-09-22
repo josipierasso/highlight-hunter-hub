@@ -55,6 +55,29 @@ const MIN_WORDS = 12;
 const LIGHT_DEDUP_IOU = 0.85;
 const RESULT_OVERLAP = 0.55;
 
+export function isFiniteDuration(value: number) {
+  return Number.isFinite(value) && value > 0;
+}
+
+export function formatClock(seconds: number) {
+  if (!isFiniteDuration(seconds) && seconds !== 0) return "—";
+  const s = Math.max(0, Math.round(seconds));
+  const m = Math.floor(s / 60);
+  const rest = s % 60;
+  return `${String(m).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
+}
+
+export function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) {
+    const kb = bytes / 1024;
+    return `${kb < 10 ? kb.toFixed(1) : Math.round(kb)} KB`;
+  }
+  const mb = bytes / (1024 * 1024);
+  return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
