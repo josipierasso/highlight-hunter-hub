@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiAnalyzeRouteImport } from './routes/api/analyze'
+import { Route as ApiFetchVideoRouteImport } from './routes/api/fetch-video'
 import { Route as ApiTranscribeRouteImport } from './routes/api/transcribe'
 
 const IndexRoute = IndexRouteImport.update({
@@ -23,6 +24,11 @@ const ApiAnalyzeRoute = ApiAnalyzeRouteImport.update({
   path: '/api/analyze',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiFetchVideoRoute = ApiFetchVideoRouteImport.update({
+  id: '/api/fetch-video',
+  path: '/api/fetch-video',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ApiTranscribeRoute = ApiTranscribeRouteImport.update({
   id: '/api/transcribe',
   path: '/api/transcribe',
@@ -32,30 +38,34 @@ const ApiTranscribeRoute = ApiTranscribeRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/analyze': typeof ApiAnalyzeRoute
+  '/api/fetch-video': typeof ApiFetchVideoRoute
   '/api/transcribe': typeof ApiTranscribeRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/analyze': typeof ApiAnalyzeRoute
+  '/api/fetch-video': typeof ApiFetchVideoRoute
   '/api/transcribe': typeof ApiTranscribeRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/api/analyze': typeof ApiAnalyzeRoute
+  '/api/fetch-video': typeof ApiFetchVideoRoute
   '/api/transcribe': typeof ApiTranscribeRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/analyze' | '/api/transcribe'
+  fullPaths: '/' | '/api/analyze' | '/api/fetch-video' | '/api/transcribe'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/analyze' | '/api/transcribe'
-  id: '__root__' | '/' | '/api/analyze' | '/api/transcribe'
+  to: '/' | '/api/analyze' | '/api/fetch-video' | '/api/transcribe'
+  id: '__root__' | '/' | '/api/analyze' | '/api/fetch-video' | '/api/transcribe'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiAnalyzeRoute: typeof ApiAnalyzeRoute
+  ApiFetchVideoRoute: typeof ApiFetchVideoRoute
   ApiTranscribeRoute: typeof ApiTranscribeRoute
 }
 
@@ -75,6 +85,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiAnalyzeRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/fetch-video': {
+      id: '/api/fetch-video'
+      path: '/api/fetch-video'
+      fullPath: '/api/fetch-video'
+      preLoaderRoute: typeof ApiFetchVideoRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/transcribe': {
       id: '/api/transcribe'
       path: '/api/transcribe'
@@ -88,6 +105,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiAnalyzeRoute: ApiAnalyzeRoute,
+  ApiFetchVideoRoute: ApiFetchVideoRoute,
   ApiTranscribeRoute: ApiTranscribeRoute,
 }
 export const routeTree = rootRouteImport
