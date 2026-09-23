@@ -4,24 +4,29 @@
  */
 import type { FFmpeg } from "@ffmpeg/ffmpeg";
 
-const CORE_BASE = "https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd";
+const CORE_BASE = "https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm";
 
 let ffmpegPromise: Promise<FFmpeg> | null = null;
 
 export async function getFFmpeg(onLog?: (line: string) => void): Promise<FFmpeg> {
   if (!ffmpegPromise) {
     ffmpegPromise = (async () => {
-      const [{ FFmpeg: FFmpegClass }, { toBlobURL }] = await Promise.all([
-        import("@ffmpeg/ffmpeg"),
-        import("@ffmpeg/util"),
-      ]);
-      const ffmpeg = new FFmpegClass();
-      ffmpeg.on("log", ({ message }) => onLog?.(message));
-      await ffmpeg.load({
-        coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
-        wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
-      });
-      return ffmpeg;
+      try {
+        const [{ FFmpeg: FFmpegClass }, { toBlobURL }] = await Promise.all([
+          import("@ffmpeg/ffmpeg"),
+          import("@ffmpeg/util"),
+        ]);
+        const ffmpeg = new FFmpegClass();
+        ffmpeg.on("log", ({ message }) => onLog?.(message));
+        await ffmpeg.load({
+          coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
+          wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+        });
+        return ffmpeg;
+      } catch (error) {
+        ffmpegPromise = null;
+        throw error;
+      }
     })();
   }
   return ffmpegPromise;
