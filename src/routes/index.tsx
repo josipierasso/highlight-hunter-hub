@@ -173,8 +173,11 @@ function Index() {
       setProgress(0);
       let chunks;
       try {
-        chunks = await extractAudioChunks(file, CHUNK_SECONDS, (r) =>
-          setProgress(Math.round(r * 100)),
+        chunks = await extractAudioChunks(
+          file,
+          CHUNK_SECONDS,
+          (r) => setProgress(Math.round(r * 100)),
+          duration,
         );
       } catch (error) {
         throw new AnalysisError("audio", "Não foi possível extrair o áudio deste vídeo.", error);
