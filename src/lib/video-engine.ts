@@ -117,7 +117,7 @@ async function readSegmentFiles(
       chunks.push({
         start: windowStart + i * chunkSeconds,
         end: windowStart + (i + 1) * chunkSeconds,
-        blob: new Blob([data.slice() as unknown as BlobPart], { type: "audio/mpeg" }),
+        blob: new File([data.slice() as unknown as BlobPart], name, { type: "audio/mpeg" }),
       });
       await ffmpeg.deleteFile(name);
     } catch {
@@ -234,6 +234,10 @@ export async function extractAudioChunks(
         "16000",
         "-b:a",
         "48k",
+        "-id3v2_version",
+        "0",
+        "-write_xing",
+        "0",
         "-f",
         "segment",
         "-segment_time",

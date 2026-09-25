@@ -104,6 +104,48 @@ function stageLabelForError(stage: Stage) {
   }
 }
 
+async function transcribeChunk(
+  blob: Blob,
+  start: number,
+  end: number,
+): Promise<TranscriptionResult> {
+  const audio = blob instanceof File ? blob : new File([blob], "chunk.mp3", { type: "audio/mpeg" });
+  let lastError = "Falha ao transcrever um trecho.";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const form = new FormData();
+    form.append("file", audio, "chunk.mp3");
+    const res = await fetch("/api/transcribe", { method: "POST", body: form }).catch(() => null);
+    if (!res) {
+      lastError = "Sem conexão com a transcrição.";
+      await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
+      continue;
+    }
+    const info = (await res.json().catch(() => ({}))) as Partial<TranscriptionResult> & {
+      error?: string;
+    };
+    if (res.ok) {
+      return {
+        text: info.text ?? "",
+        segments: info.segments ?? [],
+        words: info.words ?? [],
+      };
+    }
+    lastError = info.error || lastError;
+    console.error("[clip-engine]", {
+      stage: "transcribing",
+      status: res.status,
+      error: info.error,
+      chunkStart: start,
+      chunkEnd: end,
+      chunkBytes: blob.size,
+      attempt,
+    });
+    if (res.status === 401 || res.status === 403 || res.status === 400) break;
+    await new Promise((resolve) => setTimeout(resolve, 800 * (attempt + 1)));
+  }
+  throw new AnalysisError("transcribing", lastError);
+}
+
 function logStageFailure(stage: Stage, error: unknown, extra?: Record<string, unknown>) {
   console.error("[clip-engine]", {
     stage,
@@ -247,46 +289,24 @@ function Index() {
       setStage("transcribing");
       setStatusText("Ouvindo o vídeo e escrevendo o que é falado...");
       const transcribed: Array<{ start: number; end: number; payload: TranscriptionResult }> = [];
-      const concurrency = 3;
       let done = 0;
-      for (let i = 0; i < chunks.length; i += concurrency) {
-        const batch = chunks.slice(i, i + concurrency);
-        const results = await Promise.all(
-          batch.map(async (chunk) => {
-            const form = new FormData();
-            form.append("file", chunk.blob, "chunk.mp3");
-            const res = await fetch("/api/transcribe", { method: "POST", body: form });
-            const info = (await res.json().catch(() => ({}))) as Partial<TranscriptionResult> & {
-              error?: string;
-            };
-            if (!res.ok) {
-              console.error("[clip-engine]", {
-                stage: "transcribing",
-                status: res.status,
-                error: info.error,
-                chunkStart: chunk.start,
-                chunkEnd: chunk.end,
-                chunkBytes: chunk.blob.size,
-              });
-              throw new AnalysisError(
-                "transcribing",
-                info.error || "Falha ao transcrever um trecho.",
-              );
-            }
-            return {
-              start: chunk.start,
-              end: chunk.end,
-              payload: {
-                text: info.text ?? "",
-                segments: info.segments ?? [],
-                words: info.words ?? [],
-              },
-            };
-          }),
-        );
-        transcribed.push(...results);
-        done += batch.length;
+      for (const chunk of chunks) {
+        if (chunk.blob.size < 800) {
+          done += 1;
+          setProgress(Math.round((done / chunks.length) * 100));
+          continue;
+        }
+        const payload = await transcribeChunk(chunk.blob, chunk.start, chunk.end);
+        transcribed.push({
+          start: chunk.start,
+          end: chunk.end,
+          payload,
+        });
+        done += 1;
         setProgress(Math.round((done / chunks.length) * 100));
+        setStatusText(
+          `Ouvindo o vídeo... ${done} de ${chunks.length} trechos (${formatTime(chunk.end)})`,
+        );
       }
 
       const segments = mergeChunkTranscripts(transcribed, duration);
@@ -387,9 +407,12 @@ function Index() {
         name: file.name,
       });
       setStage("idle");
-      toast.error("Não foi possível analisar este vídeo.", {
-        description: `Etapa: ${stageLabelForError(failed)}`,
-      });
+      toast.error(
+        error instanceof AnalysisError ? error.message : "Não foi possível analisar este vídeo.",
+        {
+          description: `Etapa: ${stageLabelForError(failed)}`,
+        },
+      );
     }
   }, [duration, file, filmTitle, scriptScenes, scriptText, targetCount]);
 
