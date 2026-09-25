@@ -9,15 +9,20 @@ import {
   formatBytes,
   formatClock,
   generateClipCandidates,
+  groupClipsByCategory,
   intervalIoU,
   isFiniteDuration,
+  mergeCandidatePools,
   mergeChunkTranscripts,
   MIN_CLIP_SECONDS,
   MAX_CLIP_SECONDS,
+  MAX_VIDEO_SECONDS,
+  normalizeCategory,
   normalizeTranscription,
   offsetTranscript,
   overlapRatio,
   parseTranscriptionPayload,
+  sampleTranscript,
   selectCandidatesForAnalysis,
   snapClipToCandidates,
   startsOnSegmentBoundary,
@@ -377,6 +382,8 @@ describe("invalid media metadata", () => {
     assert.equal(isFiniteDuration(Infinity), false);
     assert.equal(isFiniteDuration(Number.NaN), false);
     assert.equal(formatClock(77.8), "01:18");
+    assert.equal(formatClock(2 * 60 * 60), "02:00:00");
+    assert.equal(formatClock(69 * 60 + 37), "01:09:37");
   });
 
   it("does not round small files to 0 MB", () => {
@@ -406,5 +413,61 @@ describe("invalid media metadata", () => {
       assert.equal(Number.isFinite(candidate.start), true);
       assert.equal(Number.isFinite(candidate.end), true);
     }
+  });
+
+  it("accepts a 2-hour duration cap", () => {
+    assert.equal(MAX_VIDEO_SECONDS, 7200);
+    assert.equal(isFiniteDuration(MAX_VIDEO_SECONDS), true);
+  });
+
+  it("samples a long transcript without losing the ends", () => {
+    const many = Array.from({ length: 800 }, (_, i) => speech(i, i + 0.8, `fala ${i}`));
+    const sampled = sampleTranscript(many, 400);
+    assert.ok(sampled.length <= 400);
+    assert.equal(sampled[0]?.text, "fala 0");
+    assert.equal(sampled.at(-1)?.text, "fala 799");
+  });
+});
+
+describe("categories", () => {
+  it("normalizes aliases into the scene taxonomy", () => {
+    assert.equal(normalizeCategory("ação"), "acao");
+    assert.equal(normalizeCategory("fight"), "luta");
+    assert.equal(normalizeCategory("romance"), "romantico");
+    assert.equal(normalizeCategory("desconhecido"), "outro");
+  });
+
+  it("groups finalized clips by category", () => {
+    const groups = groupClipsByCategory([
+      {
+        title: "Soco",
+        start: 10,
+        end: 40,
+        category: "luta",
+        reason: "combate",
+        hook: "soco",
+        score: 80,
+      },
+      {
+        title: "Beijo",
+        start: 90,
+        end: 120,
+        category: "romantico",
+        reason: "casal",
+        hook: "te amo",
+        score: 70,
+      },
+    ]);
+    assert.equal(groups[0]?.category, "luta");
+    assert.equal(groups[1]?.category, "romantico");
+  });
+
+  it("merges speech and screenplay candidates without duplicates", () => {
+    const merged = mergeCandidatePools(
+      [{ start: 10, end: 40, text: "luta", speechSeconds: 20, source: "screenplay" }],
+      [{ start: 10, end: 40, text: "luta", speechSeconds: 20, source: "speech" }],
+      [{ start: 80, end: 110, text: "beijo", speechSeconds: 25, source: "speech" }],
+    );
+    assert.equal(merged.length, 2);
   });
 });

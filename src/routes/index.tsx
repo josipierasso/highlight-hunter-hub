@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Clapperboard,
   Download,
+  FileText,
   Film,
   Loader2,
   ShieldAlert,
@@ -16,18 +17,33 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Toaster } from "@/components/ui/sonner";
 import {
+  CATEGORY_LABEL,
   finalizeClips,
   formatBytes,
   formatClock,
   generateClipCandidates,
+  groupClipsByCategory,
   isFiniteDuration,
+  MAX_VIDEO_SECONDS,
+  mergeCandidatePools,
   mergeChunkTranscripts,
+  normalizeCategory,
+  sampleTranscript,
   selectCandidatesForAnalysis,
   type Clip,
   type TranscriptionResult,
 } from "@/lib/clip-engine";
+import {
+  alignScreenplayToTranscript,
+  candidatesFromScreenplay,
+  parseScreenplay,
+  readScreenplayFile,
+  summarizeScreenplay,
+  type ScreenplayScene,
+} from "@/lib/screenplay";
 import { cutClip, extractAudioChunks, extractFrames, getVideoDuration } from "@/lib/video-engine";
 
 export const Route = createFileRoute("/")({
@@ -37,13 +53,13 @@ export const Route = createFileRoute("/")({
       {
         name: "description",
         content:
-          "Envie um vídeo longo, deixe a IA estudar o conteúdo e baixe os melhores cortes verticais. Nada é salvo em servidor.",
+          "Envie um filme de até 2 horas e o roteiro. A IA separa ação, luta, romance e outras cenas para você baixar.",
       },
       { property: "og:title", content: "ClipForge — cortes inteligentes sem nuvem" },
       {
         property: "og:description",
         content:
-          "Análise de ritmo, clímax, discussões e aulas para gerar cortes de 15 a 60 segundos direto no seu navegador.",
+          "Leitura de roteiro, transcrição e cortes de 15 a 90 segundos por categoria, direto no navegador.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -54,17 +70,9 @@ export const Route = createFileRoute("/")({
 
 type Stage = "idle" | "audio" | "transcribing" | "frames" | "analyzing" | "done";
 
-const CATEGORY_LABEL: Record<string, string> = {
-  luta: "Luta / ação",
-  climax: "Clímax",
-  discussao: "Discussão",
-  estudo: "Estudo",
-  apresentacao: "Apresentação",
-  outro: "Destaque",
-};
-
 const CHUNK_SECONDS = 90;
 const MAX_FRAMES = 30;
+const ALL_CATEGORIES = "todas";
 
 function formatTime(seconds: number) {
   return formatClock(seconds);
@@ -113,9 +121,20 @@ function Index() {
   const [targetCount, setTargetCount] = useState(8);
   const [rendering, setRendering] = useState<number | null>(null);
   const [renderProgress, setRenderProgress] = useState(0);
+  const [scriptName, setScriptName] = useState("");
+  const [scriptText, setScriptText] = useState("");
+  const [scriptScenes, setScriptScenes] = useState<ScreenplayScene[]>([]);
+  const [categoryFilter, setCategoryFilter] = useState<string>(ALL_CATEGORIES);
+  const [batching, setBatching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const scriptRef = useRef<HTMLInputElement>(null);
 
   const busy = stage !== "idle" && stage !== "done";
+  const grouped = useMemo(() => groupClipsByCategory(clips), [clips]);
+  const visibleClips = useMemo(() => {
+    if (categoryFilter === ALL_CATEGORIES) return clips;
+    return clips.filter((clip) => clip.category === categoryFilter);
+  }, [clips, categoryFilter]);
 
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
@@ -135,14 +154,18 @@ function Index() {
     setProgress(0);
     setDuration(0);
     setFile(picked);
+    setCategoryFilter(ALL_CATEGORIES);
     setStatusText("Calculando duração...");
     try {
       const dur = await getVideoDuration(picked);
       if (!isFiniteDuration(dur)) {
         throw new Error("Duração inválida.");
       }
+      if (dur > MAX_VIDEO_SECONDS + 30) {
+        throw new Error("Este arquivo passa de 2 horas.");
+      }
       setDuration(dur);
-      setTargetCount(Math.max(3, Math.min(12, Math.round(dur / 300) + 3)));
+      setTargetCount(Math.max(6, Math.min(24, Math.round(dur / 240) + 4)));
       setStatusText("");
     } catch (error) {
       logStageFailure("idle", error, {
@@ -153,7 +176,31 @@ function Index() {
       setFile(null);
       setDuration(0);
       setStatusText("");
-      toast.error("Não conseguimos ler a duração deste vídeo. Use MP4, MOV ou WEBM.");
+      const message =
+        error instanceof Error && error.message.includes("2 horas")
+          ? "Este vídeo passa de 2 horas. Envie um arquivo de até 02:00:00."
+          : "Não conseguimos ler a duração deste vídeo. Use MP4, MOV ou WEBM.";
+      toast.error(message);
+    }
+  }, []);
+
+  const pickScript = useCallback(async (picked: File) => {
+    try {
+      const raw = await readScreenplayFile(picked);
+      const parsed = parseScreenplay(raw);
+      setScriptName(picked.name);
+      setScriptText(raw);
+      setScriptScenes(parsed.scenes);
+      toast.success(
+        parsed.scenes.length
+          ? `${parsed.scenes.length} cenas lidas no roteiro.`
+          : "Roteiro carregado.",
+      );
+    } catch (error) {
+      setScriptName("");
+      setScriptText("");
+      setScriptScenes([]);
+      toast.error(error instanceof Error ? error.message : "Não foi possível ler o roteiro.");
     }
   }, []);
 
@@ -166,6 +213,9 @@ function Index() {
           "idle",
           "A duração deste vídeo ainda não foi calculada. Troque o arquivo e tente de novo.",
         );
+      }
+      if (duration > MAX_VIDEO_SECONDS + 30) {
+        throw new AnalysisError("idle", "Este vídeo passa de 2 horas.");
       }
 
       setStage("audio");
@@ -233,13 +283,17 @@ function Index() {
       }
 
       const segments = mergeChunkTranscripts(transcribed, duration);
-      const pool = generateClipCandidates(segments, duration);
+      const alignedScenes = alignScreenplayToTranscript(scriptScenes, segments, duration);
+      const fromSpeech = generateClipCandidates(segments, duration);
+      const fromScript = candidatesFromScreenplay(alignedScenes, duration);
+      const pool = mergeCandidatePools(fromScript, fromSpeech);
       const candidates = selectCandidatesForAnalysis(pool, targetCount);
       console.info("[clip-engine]", {
         stage: "candidates",
         duration,
         chunks: chunks.length,
         segments: segments.length,
+        scenes: alignedScenes.length,
         pool: pool.length,
         candidates: candidates.length,
       });
@@ -262,16 +316,24 @@ function Index() {
 
       current = "analyzing";
       setStage("analyzing");
-      setStatusText("Estudando ritmo, clímax e contexto para escolher os cortes...");
+      setStatusText("Lendo o roteiro e separando as cenas para corte...");
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           duration,
           targetCount,
-          segments,
-          candidates: candidates.map(({ start, end, text }) => ({ start, end, text })),
+          segments: sampleTranscript(segments, 400),
+          candidates: candidates.map((candidate) => ({
+            start: candidate.start,
+            end: candidate.end,
+            text: candidate.text,
+            ...(candidate.source ? { source: candidate.source } : {}),
+            ...(candidate.heading ? { heading: candidate.heading } : {}),
+            ...(candidate.categoryHint ? { categoryHint: candidate.categoryHint } : {}),
+          })),
           frames,
+          screenplay: summarizeScreenplay(alignedScenes) || scriptText.slice(0, 18000),
         }),
       });
       const info = (await res.json().catch(() => ({}))) as {
@@ -293,8 +355,9 @@ function Index() {
       const valid = finalizeClips(info.clips || [], candidates, duration, targetCount);
       setOverview(info.overview || "");
       setClips(valid);
+      setCategoryFilter(ALL_CATEGORIES);
       setStage("done");
-      toast.success(`${valid.length} cortes prontos para baixar.`);
+      toast.success(`${valid.length} cortes prontos, agrupados por cena.`);
     } catch (error) {
       const failed = error instanceof AnalysisError ? error.stage : current;
       logStageFailure(failed, error, {
@@ -308,7 +371,22 @@ function Index() {
         description: `Etapa: ${stageLabelForError(failed)}`,
       });
     }
-  }, [duration, file, targetCount]);
+  }, [duration, file, scriptScenes, scriptText, targetCount]);
+
+  const saveBlob = (blob: Blob, name: string) => {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = name;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  };
+
+  const fileNameFor = (clip: Clip, vertical: boolean) => {
+    const slug = clip.title.replace(/[^\p{L}\p{N} -]/gu, "").slice(0, 50) || "corte";
+    const cat = CATEGORY_LABEL[normalizeCategory(clip.category)];
+    return `${cat}-${slug}${vertical ? "-9x16" : ""}.mp4`;
+  };
 
   const download = useCallback(
     async (clip: Clip, index: number, vertical: boolean) => {
@@ -319,14 +397,7 @@ function Index() {
         const blob = await cutClip(file, clip.start, clip.end, vertical, (r) =>
           setRenderProgress(Math.round(r * 100)),
         );
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = `${clip.title.replace(/[^\p{L}\p{N} -]/gu, "").slice(0, 60) || "corte"}${
-          vertical ? "-9x16" : ""
-        }.mp4`;
-        link.click();
-        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        saveBlob(blob, fileNameFor(clip, vertical));
       } catch {
         toast.error("Não foi possível gerar esse corte.");
       } finally {
@@ -334,6 +405,32 @@ function Index() {
       }
     },
     [file],
+  );
+
+  const downloadVisible = useCallback(
+    async (vertical: boolean) => {
+      if (!file || !visibleClips.length) return;
+      setBatching(true);
+      try {
+        for (let i = 0; i < visibleClips.length; i++) {
+          const clip = visibleClips[i];
+          if (!clip) continue;
+          setRendering(i);
+          setRenderProgress(0);
+          const blob = await cutClip(file, clip.start, clip.end, vertical, (r) =>
+            setRenderProgress(Math.round(r * 100)),
+          );
+          saveBlob(blob, fileNameFor(clip, vertical));
+        }
+        toast.success(`${visibleClips.length} cortes baixados.`);
+      } catch {
+        toast.error("A geração em lote parou em um dos cortes.");
+      } finally {
+        setBatching(false);
+        setRendering(null);
+      }
+    },
+    [file, visibleClips],
   );
 
   const stageLabel = useMemo(
@@ -365,9 +462,9 @@ function Index() {
             <span className="block text-primary">antes da sessão acabar</span>
           </h1>
           <p className="max-w-2xl text-muted-foreground">
-            A IA estuda seu vídeo inteiro — ritmo, clímax, brigas, explicações e picos de palco — e
-            separa os melhores momentos em cortes de 15 a 60 segundos. Tudo é processado no seu
-            navegador: se atualizar a página, os cortes desaparecem.
+            Envie um filme de até 2 horas e, se quiser, o roteiro. A IA lê as falas, alinha as cenas
+            e separa ação, luta, romance, clímax e outros momentos em cortes para baixar. Nada é
+            salvo em servidor: se atualizar a página, os cortes desaparecem.
           </p>
         </header>
 
@@ -379,9 +476,9 @@ function Index() {
               className="flex w-full flex-col items-center gap-3 rounded-2xl border border-dashed border-border px-6 py-14 transition-colors hover:border-primary/60 hover:bg-primary/5"
             >
               <Upload className="size-7 text-primary" />
-              <span className="font-display text-lg">Escolher vídeo longo</span>
+              <span className="font-display text-lg">Escolher filme de até 2 horas</span>
               <span className="text-sm text-muted-foreground">
-                MP4, MOV ou WEBM · o arquivo nunca sai do seu dispositivo
+                MP4, MOV ou WEBM · depois você pode anexar o roteiro em TXT
               </span>
             </button>
           ) : (
@@ -408,10 +505,55 @@ function Index() {
                     setFile(null);
                     setClips([]);
                     setOverview("");
+                    setCategoryFilter(ALL_CATEGORIES);
                   }}
                 >
                   <X className="size-4" /> Trocar
                 </Button>
+              </div>
+
+              <div className="rounded-2xl border border-dashed border-border p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <span className="grid size-10 place-items-center rounded-xl bg-secondary text-primary">
+                      <FileText className="size-4" />
+                    </span>
+                    <div>
+                      <p className="text-sm font-medium">
+                        {scriptName || "Roteiro opcional (TXT, Fountain ou Markdown)"}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {scriptScenes.length
+                          ? `${scriptScenes.length} cenas lidas · ajuda a separar ação, luta e romance`
+                          : "Sem roteiro a IA usa só a fala e os quadros"}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    {scriptName ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() => {
+                          setScriptName("");
+                          setScriptText("");
+                          setScriptScenes([]);
+                        }}
+                      >
+                        <X className="size-4" /> Remover
+                      </Button>
+                    ) : null}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => scriptRef.current?.click()}
+                    >
+                      {scriptName ? "Trocar roteiro" : "Anexar roteiro"}
+                    </Button>
+                  </div>
+                </div>
               </div>
 
               <div className="grid gap-3">
@@ -421,8 +563,8 @@ function Index() {
                 </div>
                 <Slider
                   value={[targetCount]}
-                  min={3}
-                  max={15}
+                  min={4}
+                  max={30}
                   step={1}
                   disabled={busy}
                   onValueChange={([v]) => setTargetCount(v ?? targetCount)}
@@ -440,7 +582,7 @@ function Index() {
                 ) : (
                   <Sparkles className="size-4" />
                 )}
-                {busy ? "Analisando..." : "Analisar e separar os melhores cortes"}
+                {busy ? "Analisando..." : "Ler cenas e separar os cortes"}
               </Button>
 
               {busy && (
@@ -468,6 +610,17 @@ function Index() {
               e.target.value = "";
             }}
           />
+          <input
+            ref={scriptRef}
+            type="file"
+            accept=".txt,.fountain,.md,text/plain"
+            hidden
+            onChange={(e) => {
+              const picked = e.target.files?.[0];
+              if (picked) void pickScript(picked);
+              e.target.value = "";
+            }}
+          />
         </section>
 
         {overview && (
@@ -479,20 +632,54 @@ function Index() {
 
         {clips.length > 0 && (
           <section className="mt-8 grid gap-4">
-            <div className="flex items-center gap-2">
-              <Clapperboard className="size-5 text-primary" />
-              <h2 className="font-display text-xl">Cortes sugeridos</h2>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Clapperboard className="size-5 text-primary" />
+                <h2 className="font-display text-xl">Cenas separadas</h2>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={batching || rendering !== null || !visibleClips.length}
+                  onClick={() => void downloadVisible(false)}
+                >
+                  {batching ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Download className="size-4" />
+                  )}
+                  Baixar visíveis
+                </Button>
+                <Button
+                  size="sm"
+                  disabled={batching || rendering !== null || !visibleClips.length}
+                  onClick={() => void downloadVisible(true)}
+                >
+                  Baixar visíveis 9:16
+                </Button>
+              </div>
             </div>
-            {clips.map((clip, index) => (
+            <Tabs value={categoryFilter} onValueChange={setCategoryFilter}>
+              <TabsList className="flex h-auto w-full flex-wrap justify-start gap-1">
+                <TabsTrigger value={ALL_CATEGORIES}>Todas ({clips.length})</TabsTrigger>
+                {grouped.map((group) => (
+                  <TabsTrigger key={group.category} value={group.category}>
+                    {CATEGORY_LABEL[group.category]} ({group.clips.length})
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </Tabs>
+            {visibleClips.map((clip, index) => (
               <article
-                key={`${clip.start}-${index}`}
+                key={`${clip.start}-${clip.category}-${index}`}
                 className="rounded-2xl border border-border bg-card/70 p-5 transition-colors hover:border-primary/40"
               >
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div className="max-w-2xl">
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge className="bg-primary/15 text-primary hover:bg-primary/20">
-                        {CATEGORY_LABEL[clip.category] ?? CATEGORY_LABEL["outro"]}
+                        {CATEGORY_LABEL[normalizeCategory(clip.category)]}
                       </Badge>
                       <span className="text-sm text-muted-foreground">
                         {formatTime(clip.start)} → {formatTime(clip.end)} ·{" "}
@@ -511,7 +698,7 @@ function Index() {
                   <div className="flex flex-col gap-2">
                     <Button
                       onClick={() => void download(clip, index, true)}
-                      disabled={rendering !== null}
+                      disabled={rendering !== null || batching}
                     >
                       {rendering === index ? (
                         <Loader2 className="size-4 animate-spin" />
@@ -523,7 +710,7 @@ function Index() {
                     <Button
                       variant="outline"
                       onClick={() => void download(clip, index, false)}
-                      disabled={rendering !== null}
+                      disabled={rendering !== null || batching}
                     >
                       Baixar original
                     </Button>

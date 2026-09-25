@@ -16,11 +16,77 @@ export type TranscriptionResult = {
   words: TranscriptWord[];
 };
 
+export const CLIP_CATEGORIES = [
+  "acao",
+  "luta",
+  "romantico",
+  "climax",
+  "comedia",
+  "drama",
+  "suspense",
+  "discussao",
+  "estudo",
+  "apresentacao",
+  "outro",
+] as const;
+
+export type ClipCategory = (typeof CLIP_CATEGORIES)[number];
+
+export const CATEGORY_LABEL: Record<ClipCategory, string> = {
+  acao: "Ação",
+  luta: "Luta",
+  romantico: "Romântico",
+  climax: "Clímax",
+  comedia: "Comédia",
+  drama: "Drama",
+  suspense: "Suspense",
+  discussao: "Discussão",
+  estudo: "Estudo",
+  apresentacao: "Apresentação",
+  outro: "Outro",
+};
+
+export const CATEGORY_ALIASES: Record<string, ClipCategory> = {
+  acao: "acao",
+  ação: "acao",
+  action: "acao",
+  luta: "luta",
+  fight: "luta",
+  combate: "luta",
+  romantico: "romantico",
+  romântico: "romantico",
+  romance: "romantico",
+  romantic: "romantico",
+  climax: "climax",
+  clímax: "climax",
+  comedia: "comedia",
+  comédia: "comedia",
+  comedy: "comedia",
+  drama: "drama",
+  suspense: "suspense",
+  discussao: "discussao",
+  discussão: "discussao",
+  estudo: "estudo",
+  apresentacao: "apresentacao",
+  apresentação: "apresentacao",
+  outro: "outro",
+};
+
+export function normalizeCategory(value: string | undefined): ClipCategory {
+  if (!value) return "outro";
+  const key = value.trim().toLowerCase();
+  if (CATEGORY_ALIASES[key]) return CATEGORY_ALIASES[key];
+  return CLIP_CATEGORIES.includes(key as ClipCategory) ? (key as ClipCategory) : "outro";
+}
+
 export type ClipCandidate = {
   start: number;
   end: number;
   text: string;
   speechSeconds: number;
+  source?: "speech" | "screenplay";
+  categoryHint?: ClipCategory;
+  heading?: string;
 };
 
 export type ClipScores = {
@@ -35,16 +101,19 @@ export type Clip = {
   title: string;
   start: number;
   end: number;
-  category: string;
+  category: ClipCategory;
   reason: string;
   hook: string;
   score: number;
   scores?: ClipScores;
+  heading?: string;
 };
 
 export const MIN_CLIP_SECONDS = 15;
 export const MAX_CLIP_SECONDS = 90;
-export const MAX_CANDIDATES_FOR_LLM = 24;
+export const MAX_CANDIDATES_FOR_LLM = 36;
+export const MAX_VIDEO_SECONDS = 2 * 60 * 60;
+export const MAX_RESULT_CLIPS = 40;
 
 const SENTENCE_END = /[.!?…]+["'”’)]*$/;
 const MAX_SENTENCE_SECONDS = 14;
@@ -62,8 +131,12 @@ export function isFiniteDuration(value: number) {
 export function formatClock(seconds: number) {
   if (!isFiniteDuration(seconds) && seconds !== 0) return "—";
   const s = Math.max(0, Math.round(seconds));
-  const m = Math.floor(s / 60);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
   const rest = s % 60;
+  if (h > 0) {
+    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
+  }
   return `${String(m).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
 }
 
@@ -312,6 +385,20 @@ export function mergeChunkTranscripts(
   return merged.sort((a, b) => a.start - b.start);
 }
 
+export function sampleTranscript(segments: TranscriptSegment[], max = 400): TranscriptSegment[] {
+  if (segments.length <= max) return segments;
+  const picked: TranscriptSegment[] = [];
+  const seen = new Set<number>();
+  for (let i = 0; i < max; i++) {
+    const idx = Math.round((i / Math.max(1, max - 1)) * (segments.length - 1));
+    if (seen.has(idx)) continue;
+    seen.add(idx);
+    const item = segments[idx];
+    if (item) picked.push(item);
+  }
+  return picked;
+}
+
 function overlapSeconds(a: { start: number; end: number }, b: { start: number; end: number }) {
   return Math.max(0, Math.min(a.end, b.end) - Math.max(a.start, b.start));
 }
@@ -340,12 +427,13 @@ export function cheapCandidateScore(candidate: ClipCandidate) {
   const density = speechDensity(candidate);
   const words = Math.min(wordCount(candidate.text), 90);
   const punch =
-    /[!?]|por que|porque|nunca|sempre|absurdo|incrív|olha só|atenção|espera|mentir|verdade/i.test(
+    /[!?]|por que|porque|nunca|sempre|absurdo|incrív|olha só|atenção|espera|mentir|verdade|beijo|luta|soco|tiro|te amo/i.test(
       candidate.text,
     )
       ? 1
       : 0;
-  return sweet * 40 + density * 30 + (words / 90) * 20 + punch * 10;
+  const scriptBoost = candidate.source === "screenplay" ? 8 : 0;
+  return sweet * 40 + density * 30 + (words / 90) * 20 + punch * 10 + scriptBoost;
 }
 
 export function generateClipCandidates(
@@ -394,6 +482,7 @@ export function generateClipCandidates(
       end: roundTime(Math.min(end, duration || end)),
       text,
       speechSeconds: roundTime(speechSeconds),
+      source: "speech",
     });
   };
 
@@ -422,9 +511,30 @@ export function selectCandidatesForAnalysis(
   limit = MAX_CANDIDATES_FOR_LLM,
 ): ClipCandidate[] {
   const ranked = [...candidates].sort((a, b) => cheapCandidateScore(b) - cheapCandidateScore(a));
-  const picked = dedupeByOverlap(ranked, LIGHT_DEDUP_IOU);
-  const cap = Math.min(limit, Math.max(12, targetCount * 3));
-  return picked.slice(0, cap).sort((a, b) => a.start - b.start);
+  const unique = dedupeByOverlap(ranked, LIGHT_DEDUP_IOU);
+  const cap = Math.min(limit, Math.max(16, targetCount * 3));
+  const groups = new Map<string, ClipCandidate[]>();
+  for (const item of unique) {
+    const bucket = item.categoryHint ?? item.source ?? "speech";
+    const list = groups.get(bucket) ?? [];
+    list.push(item);
+    groups.set(bucket, list);
+  }
+  const diversified: ClipCandidate[] = [];
+  const seen = new Set<string>();
+  let added = true;
+  while (diversified.length < cap && added) {
+    added = false;
+    for (const list of groups.values()) {
+      const next = list.find((item) => !seen.has(`${item.start}:${item.end}`));
+      if (!next) continue;
+      seen.add(`${next.start}:${next.end}`);
+      diversified.push(next);
+      added = true;
+      if (diversified.length >= cap) break;
+    }
+  }
+  return diversified.sort((a, b) => a.start - b.start);
 }
 
 export function dedupeByOverlap<T extends { start: number; end: number; score?: number }>(
@@ -521,16 +631,47 @@ export function finalizeClips(
       end,
       score,
       scores,
-      category: clip.category || "outro",
+      category: normalizeCategory(clip.category),
       title: clip.title.trim() || "Corte",
       hook: clip.hook.trim(),
       reason: clip.reason.trim(),
     });
   }
 
+  const cap = Math.min(MAX_RESULT_CLIPS, Math.max(1, targetCount));
   return dedupeByOverlap(prepared, RESULT_OVERLAP)
     .sort((a, b) => b.score - a.score)
-    .slice(0, Math.max(1, targetCount));
+    .slice(0, cap);
+}
+
+export function groupClipsByCategory(
+  clips: Clip[],
+): Array<{ category: ClipCategory; clips: Clip[] }> {
+  const buckets = new Map<ClipCategory, Clip[]>();
+  for (const clip of clips) {
+    const category = normalizeCategory(clip.category);
+    const list = buckets.get(category) ?? [];
+    list.push(clip);
+    buckets.set(category, list);
+  }
+  return CLIP_CATEGORIES.filter((category) => buckets.has(category)).map((category) => ({
+    category,
+    clips: buckets.get(category) ?? [],
+  }));
+}
+
+export function mergeCandidatePools(...pools: ClipCandidate[][]): ClipCandidate[] {
+  const merged: ClipCandidate[] = [];
+  const seen = new Set<string>();
+  for (const pool of pools) {
+    for (const candidate of pool) {
+      const key = `${candidate.start.toFixed(2)}:${candidate.end.toFixed(2)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(candidate);
+    }
+  }
+  return merged.sort((a, b) => a.start - b.start);
 }
 
 export function startsOnSegmentBoundary(

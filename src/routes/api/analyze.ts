@@ -5,17 +5,31 @@ const GATEWAY = "https://ai.gateway.lovable.dev/v1/responses";
 const MODEL = "openai/gpt-6-astra";
 
 const BodySchema = z.object({
-  duration: z.number().finite().positive(),
-  targetCount: z.number().min(1).max(20).default(8),
+  duration: z
+    .number()
+    .finite()
+    .positive()
+    .max(2 * 60 * 60 + 30),
+  targetCount: z.number().min(1).max(40).default(8),
   segments: z
     .array(z.object({ start: z.number(), end: z.number(), text: z.string() }))
-    .max(400)
+    .max(800)
     .default([]),
   candidates: z
-    .array(z.object({ start: z.number(), end: z.number(), text: z.string() }))
-    .max(40)
+    .array(
+      z.object({
+        start: z.number(),
+        end: z.number(),
+        text: z.string(),
+        source: z.enum(["speech", "screenplay"]).optional(),
+        heading: z.string().optional(),
+        categoryHint: z.string().optional(),
+      }),
+    )
+    .max(60)
     .default([]),
   frames: z.array(z.object({ time: z.number(), dataUrl: z.string() })).max(40),
+  screenplay: z.string().max(40000).optional().default(""),
 });
 
 const clipSchema = {
@@ -36,7 +50,19 @@ const clipSchema = {
           end: { type: "number" },
           category: {
             type: "string",
-            enum: ["luta", "climax", "discussao", "estudo", "apresentacao", "outro"],
+            enum: [
+              "acao",
+              "luta",
+              "romantico",
+              "climax",
+              "comedia",
+              "drama",
+              "suspense",
+              "discussao",
+              "estudo",
+              "apresentacao",
+              "outro",
+            ],
           },
           reason: { type: "string" },
           hook: { type: "string" },
@@ -73,15 +99,24 @@ export const Route = createFileRoute("/api/analyze")({
         }
 
         const body = BodySchema.parse(await request.json());
-        const pools = body.candidates.length ? body.candidates : body.segments;
         const transcript = body.segments
           .map((segment) => formatWindow(segment.start, segment.end, segment.text))
           .join("\n");
-        const candidateBlock = pools
-          .map(
-            (candidate, index) =>
-              `${index + 1}. ${formatWindow(candidate.start, candidate.end, candidate.text)}`,
-          )
+        const candidateBlock = (body.candidates.length ? body.candidates : body.segments)
+          .map((candidate, index) => {
+            const extra = [
+              "source" in candidate && candidate.source ? `origem=${candidate.source}` : "",
+              "heading" in candidate && candidate.heading ? `cena=${candidate.heading}` : "",
+              "categoryHint" in candidate && candidate.categoryHint
+                ? `sugestao=${candidate.categoryHint}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join(" · ");
+            return `${index + 1}. ${formatWindow(candidate.start, candidate.end, candidate.text)}${
+              extra ? ` (${extra})` : ""
+            }`;
+          })
           .join("\n");
 
         const content: Array<Record<string, unknown>> = [
@@ -91,11 +126,15 @@ export const Route = createFileRoute("/api/analyze")({
               `Duração total do vídeo: ${body.duration.toFixed(0)} segundos.`,
               `Quantidade desejada de clipes: ${body.targetCount}.`,
               "",
-              "Transcrição com timestamps reais da fala:",
-              transcript || "(sem fala detectada — use apenas os quadros de imagem)",
+              "Roteiro / cenas (se houver). Use como mapa da história:",
+              body.screenplay?.trim() || "(sem roteiro enviado)",
               "",
-              "Candidatos já recortados em frases. Escolha somente entre eles.",
+              "Transcrição com timestamps reais da fala:",
+              transcript || "(sem fala detectada — use o roteiro e os quadros)",
+              "",
+              "Candidatos já recortados. Escolha somente entre eles.",
               "Copie start e end do candidato. Não invente novos tempos.",
+              "Se o candidato tiver heading ou source=screenplay, preserve a cena.",
               candidateBlock || "(nenhum candidato — devolva lista vazia de clips)",
               "",
               "A seguir, quadros do vídeo com o tempo indicado.",
@@ -109,16 +148,19 @@ export const Route = createFileRoute("/api/analyze")({
         }
 
         const instructions = [
-          "Você é um editor profissional de cortes virais. Estude o vídeo e ranqueie os candidatos.",
-          "Cada Short precisa ser standalone: quem nunca viu o vídeo inteiro tem de entender o assunto,",
-          "sentir um gancho no começo e um fechamento no fim, sem depender de contexto dito muito antes.",
-          "Um trecho emocionante que exige contexto anterior deve receber standalone baixo.",
+          "Você é um editor de filme e shorts. Estude roteiro, fala e quadros para separar cenas.",
+          "Categorias permitidas: acao, luta, romantico, climax, comedia, drama, suspense,",
+          "discussao, estudo, apresentacao, outro. Classifique cada corte com a categoria certa.",
+          "Ação = perseguição, explosão, tiroteio. Luta = combate corpo a corpo.",
+          "Romântico = beijo, declaração, intimidade. Clímax = virada ou revelação.",
+          "Se houver roteiro, alinhe o título à cena e cubra tipos diferentes de momento.",
+          "Cada corte precisa ser standalone: gancho no começo e fechamento no fim.",
+          "Trecho que exige contexto anterior deve receber standalone baixo.",
           "Avalie scores 0-100: hook, curiosity, clarity, emotion, standalone.",
-          "score geral deve refletir o potencial como Short, penalizando standalone abaixo de 50.",
-          "Regras: use start/end exatamente de um candidato; 15 a 90 segundos; sem duplicatas quase iguais;",
-          "prefira 15-60s quando houver opção; descarte enrolação, silêncio e repetição;",
-          "mesmo que sobrem menos clipes que o pedido.",
-          "Escreva títulos e justificativas em português do Brasil. 'hook' é a primeira frase falada do clipe.",
+          "Regras: use start/end exatamente de um candidato; 15 a 90 segundos;",
+          "sem duplicatas quase iguais; prefira 15-60s; descarte enrolação e silêncio.",
+          "Distribua categorias quando o material permitir. Títulos em português do Brasil.",
+          "'hook' é a primeira frase falada ou a didascália da cena.",
         ].join(" ");
 
         const res = await fetch(GATEWAY, {
