@@ -30,6 +30,7 @@ const BodySchema = z.object({
     .default([]),
   frames: z.array(z.object({ time: z.number(), dataUrl: z.string() })).max(40),
   screenplay: z.string().max(40000).optional().default(""),
+  filmTitle: z.string().max(120).optional().default(""),
 });
 
 const clipSchema = {
@@ -125,8 +126,11 @@ export const Route = createFileRoute("/api/analyze")({
             text: [
               `Duração total do vídeo: ${body.duration.toFixed(0)} segundos.`,
               `Quantidade desejada de clipes: ${body.targetCount}.`,
+              `Título informado pelo usuário (só contexto, não busque roteiro externo): ${
+                body.filmTitle?.trim() || "(não informado)"
+              }.`,
               "",
-              "Roteiro / cenas (se houver). Use como mapa da história:",
+              "Roteiro / cenas extraídas da fala ou anexadas pelo usuário:",
               body.screenplay?.trim() || "(sem roteiro enviado)",
               "",
               "Transcrição com timestamps reais da fala:",
@@ -153,7 +157,8 @@ export const Route = createFileRoute("/api/analyze")({
           "discussao, estudo, apresentacao, outro. Classifique cada corte com a categoria certa.",
           "Ação = perseguição, explosão, tiroteio. Luta = combate corpo a corpo.",
           "Romântico = beijo, declaração, intimidade. Clímax = virada ou revelação.",
-          "Se houver roteiro, alinhe o título à cena e cubra tipos diferentes de momento.",
+          "Se houver roteiro extraído da fala ou anexado, alinhe o título à cena.",
+          "O título do filme é só contexto. Não invente diálogos de roteiros publicados.",
           "Cada corte precisa ser standalone: gancho no começo e fechamento no fim.",
           "Trecho que exige contexto anterior deve receber standalone baixo.",
           "Avalie scores 0-100: hook, curiosity, clarity, emotion, standalone.",

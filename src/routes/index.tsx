@@ -15,6 +15,7 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -39,6 +40,8 @@ import {
 import {
   alignScreenplayToTranscript,
   candidatesFromScreenplay,
+  extractScreenplayFromTranscript,
+  guessFilmTitle,
   parseScreenplay,
   readScreenplayFile,
   summarizeScreenplay,
@@ -53,13 +56,13 @@ export const Route = createFileRoute("/")({
       {
         name: "description",
         content:
-          "Envie um filme de até 2 horas e o roteiro. A IA separa ação, luta, romance e outras cenas para você baixar.",
+          "Envie um filme de até 2 horas. A IA monta o roteiro a partir da fala e separa ação, luta e romance para baixar.",
       },
       { property: "og:title", content: "ClipForge — cortes inteligentes sem nuvem" },
       {
         property: "og:description",
         content:
-          "Leitura de roteiro, transcrição e cortes de 15 a 90 segundos por categoria, direto no navegador.",
+          "Transcrição, roteiro extraído da fala e cortes de 15 a 90 segundos por categoria, direto no navegador.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -124,6 +127,8 @@ function Index() {
   const [scriptName, setScriptName] = useState("");
   const [scriptText, setScriptText] = useState("");
   const [scriptScenes, setScriptScenes] = useState<ScreenplayScene[]>([]);
+  const [filmTitle, setFilmTitle] = useState("");
+  const [extractedScenes, setExtractedScenes] = useState<ScreenplayScene[]>([]);
   const [categoryFilter, setCategoryFilter] = useState<string>(ALL_CATEGORIES);
   const [batching, setBatching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -155,6 +160,8 @@ function Index() {
     setDuration(0);
     setFile(picked);
     setCategoryFilter(ALL_CATEGORIES);
+    setExtractedScenes([]);
+    setFilmTitle((current) => current.trim() || guessFilmTitle(picked.name));
     setStatusText("Calculando duração...");
     try {
       const dur = await getVideoDuration(picked);
@@ -283,7 +290,10 @@ function Index() {
       }
 
       const segments = mergeChunkTranscripts(transcribed, duration);
-      const alignedScenes = alignScreenplayToTranscript(scriptScenes, segments, duration);
+      const fromSpeechScenes = extractScreenplayFromTranscript(segments, duration);
+      setExtractedScenes(fromSpeechScenes.scenes);
+      const sourceScenes = scriptScenes.length ? scriptScenes : fromSpeechScenes.scenes;
+      const alignedScenes = alignScreenplayToTranscript(sourceScenes, segments, duration);
       const fromSpeech = generateClipCandidates(segments, duration);
       const fromScript = candidatesFromScreenplay(alignedScenes, duration);
       const pool = mergeCandidatePools(fromScript, fromSpeech);
@@ -294,6 +304,8 @@ function Index() {
         chunks: chunks.length,
         segments: segments.length,
         scenes: alignedScenes.length,
+        extracted: fromSpeechScenes.scenes.length,
+        attachedScript: scriptScenes.length,
         pool: pool.length,
         candidates: candidates.length,
       });
@@ -316,13 +328,18 @@ function Index() {
 
       current = "analyzing";
       setStage("analyzing");
-      setStatusText("Lendo o roteiro e separando as cenas para corte...");
+      setStatusText(
+        scriptScenes.length
+          ? "Lendo o roteiro anexado e separando as cenas..."
+          : "Montando o roteiro a partir da fala e separando as cenas...",
+      );
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           duration,
           targetCount,
+          filmTitle: filmTitle.trim(),
           segments: sampleTranscript(segments, 400),
           candidates: candidates.map((candidate) => ({
             start: candidate.start,
@@ -333,7 +350,10 @@ function Index() {
             ...(candidate.categoryHint ? { categoryHint: candidate.categoryHint } : {}),
           })),
           frames,
-          screenplay: summarizeScreenplay(alignedScenes) || scriptText.slice(0, 18000),
+          screenplay:
+            summarizeScreenplay(alignedScenes) ||
+            scriptText.slice(0, 18000) ||
+            fromSpeechScenes.text.slice(0, 18000),
         }),
       });
       const info = (await res.json().catch(() => ({}))) as {
@@ -371,7 +391,7 @@ function Index() {
         description: `Etapa: ${stageLabelForError(failed)}`,
       });
     }
-  }, [duration, file, scriptScenes, scriptText, targetCount]);
+  }, [duration, file, filmTitle, scriptScenes, scriptText, targetCount]);
 
   const saveBlob = (blob: Blob, name: string) => {
     const url = URL.createObjectURL(blob);
@@ -462,9 +482,9 @@ function Index() {
             <span className="block text-primary">antes da sessão acabar</span>
           </h1>
           <p className="max-w-2xl text-muted-foreground">
-            Envie um filme de até 2 horas e, se quiser, o roteiro. A IA lê as falas, alinha as cenas
-            e separa ação, luta, romance, clímax e outros momentos em cortes para baixar. Nada é
-            salvo em servidor: se atualizar a página, os cortes desaparecem.
+            Envie um filme de até 2 horas. A IA transcreve a fala, monta o roteiro a partir dela e
+            separa ação, luta, romance, clímax e outros momentos. O título do filme é só contexto —
+            nenhum roteiro é baixado da internet. Nada é salvo em servidor.
           </p>
         </header>
 
@@ -478,7 +498,7 @@ function Index() {
               <Upload className="size-7 text-primary" />
               <span className="font-display text-lg">Escolher filme de até 2 horas</span>
               <span className="text-sm text-muted-foreground">
-                MP4, MOV ou WEBM · depois você pode anexar o roteiro em TXT
+                MP4, MOV ou WEBM · o roteiro sai da fala; TXT anexado continua opcional
               </span>
             </button>
           ) : (
@@ -506,10 +526,25 @@ function Index() {
                     setClips([]);
                     setOverview("");
                     setCategoryFilter(ALL_CATEGORIES);
+                    setExtractedScenes([]);
                   }}
                 >
                   <X className="size-4" /> Trocar
                 </Button>
+              </div>
+
+              <div className="grid gap-2">
+                <label className="text-sm text-muted-foreground" htmlFor="film-title">
+                  Título do filme (contexto, sem busca na internet)
+                </label>
+                <Input
+                  id="film-title"
+                  value={filmTitle}
+                  disabled={busy}
+                  maxLength={120}
+                  placeholder="Ex.: Cidade de Deus"
+                  onChange={(event) => setFilmTitle(event.target.value)}
+                />
               </div>
 
               <div className="rounded-2xl border border-dashed border-border p-4">
@@ -520,12 +555,16 @@ function Index() {
                     </span>
                     <div>
                       <p className="text-sm font-medium">
-                        {scriptName || "Roteiro opcional (TXT, Fountain ou Markdown)"}
+                        {scriptName
+                          ? scriptName
+                          : extractedScenes.length
+                            ? `Roteiro extraído da fala · ${extractedScenes.length} cenas`
+                            : "Roteiro extraído da fala (TXT anexado é opcional)"}
                       </p>
                       <p className="text-xs text-muted-foreground">
                         {scriptScenes.length
-                          ? `${scriptScenes.length} cenas lidas · ajuda a separar ação, luta e romance`
-                          : "Sem roteiro a IA usa só a fala e os quadros"}
+                          ? `${scriptScenes.length} cenas anexadas · o título só classifica, não baixa roteiro`
+                          : "O roteiro é montado com a transcrição deste vídeo"}
                       </p>
                     </div>
                   </div>
@@ -550,7 +589,7 @@ function Index() {
                       disabled={busy}
                       onClick={() => scriptRef.current?.click()}
                     >
-                      {scriptName ? "Trocar roteiro" : "Anexar roteiro"}
+                      {scriptName ? "Trocar TXT" : "Anexar TXT"}
                     </Button>
                   </div>
                 </div>

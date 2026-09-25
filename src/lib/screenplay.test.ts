@@ -4,6 +4,8 @@ import { describe, it } from "node:test";
 import {
   alignScreenplayToTranscript,
   candidatesFromScreenplay,
+  extractScreenplayFromTranscript,
+  guessFilmTitle,
   hintSceneCategory,
   parseClock,
   parseScreenplay,
@@ -74,5 +76,32 @@ describe("helpers", () => {
     assert.equal(parseClock("01:09:37"), 4177);
     assert.equal(hintSceneCategory("tiroteio na rua"), "acao");
     assert.equal(hintSceneCategory("o beijo final"), "romantico");
+  });
+
+  it("guesses a film title from a noisy file name", () => {
+    assert.equal(guessFilmTitle("Cidade.de.Deus.2002.1080p.BluRay.x264.mp4"), "Cidade de Deus");
+  });
+});
+
+describe("extractScreenplayFromTranscript", () => {
+  it("splits scenes on pauses and tags categories from speech", () => {
+    const parsed = extractScreenplayFromTranscript(
+      [
+        { start: 10, end: 18, text: "Os lutadores trocam socos no ringue lotado" },
+        { start: 18.4, end: 26, text: "o público explode com cada golpe da luta" },
+        { start: 40, end: 52, text: "Eles se beijam na varanda e ela diz te amo" },
+      ],
+      80,
+    );
+    assert.equal(parsed.scenes.length, 2);
+    assert.equal(parsed.scenes[0]?.categoryHint, "luta");
+    assert.equal(parsed.scenes[1]?.categoryHint, "romantico");
+    assert.equal(parsed.scenes[0]?.start, 10);
+    assert.ok((parsed.scenes[1]?.start ?? 0) >= 40);
+  });
+
+  it("skips tiny fragments", () => {
+    const parsed = extractScreenplayFromTranscript([{ start: 1, end: 2, text: "oi" }], 10);
+    assert.equal(parsed.scenes.length, 0);
   });
 });

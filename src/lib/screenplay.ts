@@ -268,6 +268,77 @@ export function candidatesFromScreenplay(
   return candidates;
 }
 
+export function guessFilmTitle(fileName: string): string {
+  const base = fileName.replace(/\.[^.]+$/, "");
+  const cleaned = base
+    .replace(/[._]+/g, " ")
+    .replace(
+      /\b(1080p|720p|2160p|4k|bluray|webrip|web-dl|hdtv|x264|x265|hevc|aac|dts|extended|remastered|official|trailer|filme|movie)\b/gi,
+      " ",
+    )
+    .replace(/\(\d{4}\)/g, " ")
+    .replace(/\b(19|20)\d{2}\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.slice(0, 80);
+}
+
+export function extractScreenplayFromTranscript(
+  segments: TranscriptSegment[],
+  duration: number,
+): ParsedScreenplay {
+  const usable = segments
+    .filter((segment) => segment.text.trim() && segment.end > segment.start)
+    .sort((a, b) => a.start - b.start);
+  if (!usable.length) return { text: "", scenes: [] };
+
+  const scenes: ScreenplayScene[] = [];
+  let bucket: TranscriptSegment[] = [];
+  const flush = () => {
+    const first = bucket[0];
+    const last = bucket[bucket.length - 1];
+    if (!first || !last) {
+      bucket = [];
+      return;
+    }
+    const text = bucket
+      .map((item) => item.text.trim())
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (text.length < 24) {
+      bucket = [];
+      return;
+    }
+    const heading = `Cena ${scenes.length + 1}`;
+    const scene: ScreenplayScene = {
+      index: scenes.length,
+      heading,
+      text: text.slice(0, 900),
+      start: first.start,
+      end: Math.min(duration || last.end, last.end),
+    };
+    const hint = hintSceneCategory(`${heading} ${text}`);
+    if (hint) scene.categoryHint = hint;
+    scenes.push(scene);
+    bucket = [];
+  };
+
+  for (const segment of usable) {
+    const prev = bucket[bucket.length - 1];
+    const first = bucket[0];
+    const gap = prev ? segment.start - prev.end : 0;
+    const span = first ? segment.end - first.start : 0;
+    if (prev && (gap > 2.8 || span > 90)) flush();
+    bucket.push(segment);
+  }
+  flush();
+  return {
+    text: scenes.map((scene) => `${scene.heading}\n${scene.text}`).join("\n\n"),
+    scenes,
+  };
+}
+
 export function summarizeScreenplay(scenes: ScreenplayScene[], limit = 18000) {
   const lines = scenes.map((scene) => {
     const clock =
