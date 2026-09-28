@@ -188,7 +188,7 @@ function Index() {
   const [categoryFilter, setCategoryFilter] = useState<string>(ALL_CATEGORIES);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [previewing, setPreviewing] = useState<string | null>(null);
-  const [burnCaptions, setBurnCaptions] = useState(false);
+  const [burnCaptions, setBurnCaptions] = useState(true);
   const [watermark, setWatermark] = useState<File | null>(null);
   const [batching, setBatching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -480,11 +480,15 @@ function Index() {
   const download = useCallback(
     async (clip: Clip, index: number, vertical: boolean) => {
       if (!file) return;
+      const options = exportOptions(clip);
+      if (burnCaptions && !options.captions.length) {
+        toast.message("Sem fala neste corte para legendar.");
+      }
       setRendering(index);
       setRenderProgress(0);
       try {
         const blob = await cutClip(file, clip.start, clip.end, {
-          ...exportOptions(clip),
+          ...options,
           vertical,
           onProgress: (r) => setRenderProgress(Math.round(r * 100)),
         });
@@ -495,7 +499,7 @@ function Index() {
         setRendering(null);
       }
     },
-    [exportOptions, file],
+    [burnCaptions, exportOptions, file],
   );
 
   const downloadSelected = useCallback(
@@ -682,6 +686,45 @@ function Index() {
                 </div>
               </div>
 
+              <div className="grid gap-3 rounded-2xl border border-border p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <Label htmlFor="burn-captions">Colocar legenda no vídeo baixado</Label>
+                    <p className="text-xs text-muted-foreground">
+                      A fala entra queimada no MP4. O preview no navegador continua sem overlay.
+                    </p>
+                  </div>
+                  <Switch
+                    id="burn-captions"
+                    checked={burnCaptions}
+                    onCheckedChange={setBurnCaptions}
+                    disabled={busy}
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={busy}
+                    onClick={() => watermarkRef.current?.click()}
+                  >
+                    <ImagePlus className="size-4" />
+                    {watermark ? watermark.name : "Marca d'água PNG"}
+                  </Button>
+                  {watermark ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => setWatermark(null)}
+                    >
+                      <X className="size-4" /> Remover
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+
               <div className="grid gap-2">
                 <span className="text-sm text-muted-foreground">Duração de cada corte</span>
                 <div className="flex flex-wrap gap-2">
@@ -832,35 +875,16 @@ function Index() {
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-4 rounded-2xl border border-border bg-card/50 p-4">
-              <div className="flex items-center gap-2">
-                <Switch
-                  id="burn-captions"
-                  checked={burnCaptions}
-                  onCheckedChange={setBurnCaptions}
-                />
-                <Label htmlFor="burn-captions">Colocar legenda no vídeo</Label>
-              </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => watermarkRef.current?.click()}
-                >
-                  <ImagePlus className="size-4" />
-                  {watermark ? watermark.name : "Marca d'água PNG"}
-                </Button>
-                {watermark ? (
-                  <Button variant="ghost" size="sm" onClick={() => setWatermark(null)}>
-                    <X className="size-4" /> Remover
-                  </Button>
-                ) : null}
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Preview no navegador. Legenda e marca d'água entram só no arquivo baixado.
-              </p>
-            </div>
+            <p className="text-xs text-muted-foreground">
+              {burnCaptions || watermark
+                ? `Download com ${[
+                    burnCaptions ? "legenda da fala" : null,
+                    watermark ? "marca d'água" : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" e ")}. Defina isso no envio do arquivo.`
+                : "Download sem legenda nem marca d'água. Ative no envio do arquivo, acima."}
+            </p>
 
             <Tabs value={categoryFilter} onValueChange={setCategoryFilter}>
               <TabsList className="flex h-auto w-full flex-wrap justify-start gap-1">

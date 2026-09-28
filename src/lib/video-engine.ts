@@ -395,6 +395,97 @@ async function captionPng(text: string): Promise<Uint8Array> {
   return new Uint8Array(await blob.arrayBuffer());
 }
 
+const ENCODE_ARGS = [
+  "-c:v",
+  "libx264",
+  "-preset",
+  "ultrafast",
+  "-crf",
+  "26",
+  "-c:a",
+  "aac",
+  "-b:a",
+  "128k",
+  "-pix_fmt",
+  "yuv420p",
+  "-movflags",
+  "+faststart",
+];
+
+export function buildCutClipArgs(params: {
+  inputPath: string;
+  output: string;
+  start: number;
+  duration: number;
+  vertical?: boolean;
+  watermarkFile?: string | null;
+  captions?: Array<{ file: string; start: number; end: number }>;
+}): string[] {
+  const vertical = Boolean(params.vertical);
+  const watermarkFile = params.watermarkFile ?? null;
+  const captions = params.captions ?? [];
+  const burn = Boolean(watermarkFile) || captions.length > 0;
+  const duration = params.duration.toFixed(2);
+  const args = ["-ss", params.start.toFixed(2)];
+  if (burn) args.push("-t", duration);
+  args.push("-i", params.inputPath);
+  if (watermarkFile) args.push("-loop", "1", "-t", duration, "-i", watermarkFile);
+  for (const cue of captions) args.push("-loop", "1", "-t", duration, "-i", cue.file);
+  if (!burn) args.push("-t", duration);
+
+  if (!burn && !vertical) {
+    args.push("-c", "copy", "-movflags", "+faststart", params.output);
+    return args;
+  }
+  if (!burn) {
+    args.push(
+      "-vf",
+      "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=720:1280",
+      ...ENCODE_ARGS,
+      params.output,
+    );
+    return args;
+  }
+
+  const filters: string[] = [];
+  if (vertical) {
+    filters.push(
+      "[0:v]crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=720:1280,format=yuv420p[vbase]",
+    );
+  } else {
+    filters.push("[0:v]format=yuv420p[vbase]");
+  }
+  let last = "vbase";
+  let nextInput = 1;
+  if (watermarkFile) {
+    filters.push(`[${nextInput}:v]scale=140:-1,format=rgba[wm]`);
+    filters.push(`[${last}][wm]overlay=W-w-24:24[vwm]`);
+    last = "vwm";
+    nextInput += 1;
+  }
+  captions.forEach((cue, index) => {
+    const src = `cap${index}`;
+    const out = `vo${index}`;
+    filters.push(`[${nextInput}:v]scale=720:-1,format=rgba[${src}]`);
+    filters.push(
+      `[${last}][${src}]overlay=(W-w)/2:H-h-48:enable='between(t,${cue.start.toFixed(2)},${cue.end.toFixed(2)})'[${out}]`,
+    );
+    last = out;
+    nextInput += 1;
+  });
+  args.push(
+    "-filter_complex",
+    filters.join(";"),
+    "-map",
+    `[${last}]`,
+    "-map",
+    "0:a?",
+    ...ENCODE_ARGS,
+    params.output,
+  );
+  return args;
+}
+
 /** Cuts one clip locally. vertical = center-cropped 9:16 (720x1280). */
 export async function cutClip(
   file: File,
@@ -411,104 +502,41 @@ export async function cutClip(
     .filter((cue) => cue.text.trim() && cue.end > cue.start)
     .slice(0, 20);
   const watermark = options.watermark ?? null;
-  const burn = Boolean(watermark) || captions.length > 0;
   const ffmpeg = await getFFmpeg();
   const input = await openInput(ffmpeg, file);
   const output = `clip_${Date.now()}.mp4`;
   const extras: string[] = [];
+  const stamp = Date.now();
 
   const handler = ({ progress }: { progress: number }) => reportProgress?.(Math.min(1, progress));
   ffmpeg.on("progress", handler);
 
   try {
-    const args = ["-ss", start.toFixed(2), "-i", input.path, "-t", (end - start).toFixed(2)];
+    let watermarkFile: string | null = null;
     if (watermark) {
-      const wmName = `wm_${Date.now()}.png`;
+      watermarkFile = `wm_${stamp}.png`;
       const { fetchFile } = await import("@ffmpeg/util");
-      await ffmpeg.writeFile(wmName, await fetchFile(watermark));
-      extras.push(wmName);
-      args.push("-i", wmName);
+      await ffmpeg.writeFile(watermarkFile, await fetchFile(watermark));
+      extras.push(watermarkFile);
     }
+    const captionInputs: Array<{ file: string; start: number; end: number }> = [];
     for (let i = 0; i < captions.length; i++) {
       const cue = captions[i]!;
-      const name = `cap_${i}.png`;
+      const name = `cap_${stamp}_${i}.png`;
       await ffmpeg.writeFile(name, await captionPng(cue.text));
       extras.push(name);
-      args.push("-i", name);
+      captionInputs.push({ file: name, start: cue.start, end: cue.end });
     }
 
-    if (!burn && !vertical) {
-      args.push("-c", "copy", "-movflags", "+faststart", output);
-    } else if (!burn && vertical) {
-      args.push(
-        "-vf",
-        "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=720:1280",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "26",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        output,
-      );
-    } else {
-      const filters: string[] = [];
-      let last = "0:v";
-      if (vertical) {
-        filters.push(
-          "[0:v]crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=720:1280,format=yuv420p[vbase]",
-        );
-        last = "vbase";
-      } else {
-        filters.push("[0:v]format=yuv420p[vbase]");
-        last = "vbase";
-      }
-      let nextInput = 1;
-      if (watermark) {
-        filters.push(`[${nextInput}:v]scale=140:-1[wm]`);
-        filters.push(`[${last}][wm]overlay=W-w-24:24[vwm]`);
-        last = "vwm";
-        nextInput += 1;
-      }
-      captions.forEach((cue, index) => {
-        const src = `cap${index}`;
-        const out = `vo${index}`;
-        filters.push(`[${nextInput}:v]scale=min(720\\,iw):-1[${src}]`);
-        filters.push(
-          `[${last}][${src}]overlay=(W-w)/2:H-h-48:enable='between(t,${cue.start.toFixed(2)},${cue.end.toFixed(2)})'[${out}]`,
-        );
-        last = out;
-        nextInput += 1;
-      });
-      args.push(
-        "-filter_complex",
-        filters.join(";"),
-        "-map",
-        `[${last}]`,
-        "-map",
-        "0:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "26",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        output,
-      );
-    }
-
+    const args = buildCutClipArgs({
+      inputPath: input.path,
+      output,
+      start,
+      duration: Math.max(0.2, end - start),
+      vertical,
+      watermarkFile,
+      captions: captionInputs,
+    });
     const code = await ffmpeg.exec(args);
     if (code !== 0) {
       throw new Error("FFmpeg não conseguiu gerar esse corte.");
