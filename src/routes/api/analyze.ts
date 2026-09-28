@@ -31,6 +31,7 @@ const BodySchema = z.object({
   frames: z.array(z.object({ time: z.number(), dataUrl: z.string() })).max(40),
   screenplay: z.string().max(40000).optional().default(""),
   filmTitle: z.string().max(120).optional().default(""),
+  clipLength: z.number().min(15).max(180).optional().default(30),
 });
 
 const clipSchema = {
@@ -126,6 +127,7 @@ export const Route = createFileRoute("/api/analyze")({
             text: [
               `Duração total do vídeo: ${body.duration.toFixed(0)} segundos.`,
               `Quantidade desejada de clipes: ${body.targetCount}.`,
+              `Duração padronizada de cada corte: ${body.clipLength} segundos.`,
               `Título informado pelo usuário (só contexto, não busque roteiro externo): ${
                 body.filmTitle?.trim() || "(não informado)"
               }.`,
@@ -162,8 +164,8 @@ export const Route = createFileRoute("/api/analyze")({
           "Cada corte precisa ser standalone: gancho no começo e fechamento no fim.",
           "Trecho que exige contexto anterior deve receber standalone baixo.",
           "Avalie scores 0-100: hook, curiosity, clarity, emotion, standalone.",
-          "Regras: use start/end exatamente de um candidato; 15 a 90 segundos;",
-          "sem duplicatas quase iguais; prefira 15-60s; descarte enrolação e silêncio.",
+          `Regras: use start/end exatamente de um candidato; cada corte deve durar cerca de ${body.clipLength} segundos;`,
+          "sem duplicatas quase iguais; descarte enrolação e silêncio.",
           "Distribua categorias quando o material permitir. Títulos em português do Brasil.",
           "'hook' é a primeira frase falada ou a didascália da cena.",
         ].join(" ");

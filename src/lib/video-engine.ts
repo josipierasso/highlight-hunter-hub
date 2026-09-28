@@ -335,54 +335,190 @@ export async function getVideoDuration(file: File): Promise<number> {
   }
 }
 
+export type CutClipOptions = {
+  vertical?: boolean;
+  captions?: Array<{ start: number; end: number; text: string }>;
+  watermark?: Blob | File | null;
+  onProgress?: (ratio: number) => void;
+};
+
+function wrapLines(text: string, maxChars = 28) {
+  const words = text.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+  const lines: string[] = [];
+  let current = "";
+  for (const word of words) {
+    const next = current ? `${current} ${word}` : word;
+    if (next.length > maxChars && current) {
+      lines.push(current);
+      current = word;
+      if (lines.length === 2) {
+        const rest = words.slice(words.indexOf(word)).join(" ");
+        lines.push(rest.length > maxChars ? `${rest.slice(0, maxChars - 1)}…` : rest);
+        return lines.slice(0, 3);
+      }
+    } else current = next;
+  }
+  if (current) lines.push(current);
+  return lines.slice(0, 3);
+}
+
+async function captionPng(text: string): Promise<Uint8Array> {
+  const width = 720;
+  const height = 180;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Não foi possível desenhar a legenda.");
+  ctx.clearRect(0, 0, width, height);
+  ctx.font = "bold 36px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "rgba(0,0,0,0.88)";
+  ctx.lineWidth = 8;
+  ctx.fillStyle = "#fff";
+  const lines = wrapLines(text);
+  const lineH = 44;
+  const startY = height / 2 - ((lines.length - 1) * lineH) / 2;
+  lines.forEach((line, index) => {
+    const y = startY + index * lineH;
+    ctx.strokeText(line, width / 2, y);
+    ctx.fillText(line, width / 2, y);
+  });
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (value) => (value ? resolve(value) : reject(new Error("Falha na legenda."))),
+      "image/png",
+    );
+  });
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
 /** Cuts one clip locally. vertical = center-cropped 9:16 (720x1280). */
 export async function cutClip(
   file: File,
   start: number,
   end: number,
-  vertical: boolean,
+  verticalOrOptions: boolean | CutClipOptions = false,
   onProgress?: (ratio: number) => void,
 ): Promise<Blob> {
+  const options: CutClipOptions =
+    typeof verticalOrOptions === "boolean" ? { vertical: verticalOrOptions } : verticalOrOptions;
+  const reportProgress = options.onProgress ?? onProgress;
+  const vertical = Boolean(options.vertical);
+  const captions = (options.captions ?? [])
+    .filter((cue) => cue.text.trim() && cue.end > cue.start)
+    .slice(0, 20);
+  const watermark = options.watermark ?? null;
+  const burn = Boolean(watermark) || captions.length > 0;
   const ffmpeg = await getFFmpeg();
   const input = await openInput(ffmpeg, file);
   const output = `clip_${Date.now()}.mp4`;
+  const extras: string[] = [];
 
-  const handler = ({ progress }: { progress: number }) => onProgress?.(Math.min(1, progress));
+  const handler = ({ progress }: { progress: number }) => reportProgress?.(Math.min(1, progress));
   ffmpeg.on("progress", handler);
 
-  const args = ["-ss", start.toFixed(2), "-i", input.path, "-t", (end - start).toFixed(2)];
-  if (vertical) {
-    args.push(
-      "-vf",
-      "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=720:1280",
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-crf",
-      "26",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "128k",
-    );
-  } else {
-    args.push("-c", "copy");
-  }
-  args.push("-movflags", "+faststart", output);
-
   try {
+    const args = ["-ss", start.toFixed(2), "-i", input.path, "-t", (end - start).toFixed(2)];
+    if (watermark) {
+      const wmName = `wm_${Date.now()}.png`;
+      const { fetchFile } = await import("@ffmpeg/util");
+      await ffmpeg.writeFile(wmName, await fetchFile(watermark));
+      extras.push(wmName);
+      args.push("-i", wmName);
+    }
+    for (let i = 0; i < captions.length; i++) {
+      const cue = captions[i]!;
+      const name = `cap_${i}.png`;
+      await ffmpeg.writeFile(name, await captionPng(cue.text));
+      extras.push(name);
+      args.push("-i", name);
+    }
+
+    if (!burn && !vertical) {
+      args.push("-c", "copy", "-movflags", "+faststart", output);
+    } else if (!burn && vertical) {
+      args.push(
+        "-vf",
+        "crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=720:1280",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "26",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        output,
+      );
+    } else {
+      const filters: string[] = [];
+      let last = "0:v";
+      if (vertical) {
+        filters.push(
+          "[0:v]crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=720:1280,format=yuv420p[vbase]",
+        );
+        last = "vbase";
+      } else {
+        filters.push("[0:v]format=yuv420p[vbase]");
+        last = "vbase";
+      }
+      let nextInput = 1;
+      if (watermark) {
+        filters.push(`[${nextInput}:v]scale=140:-1[wm]`);
+        filters.push(`[${last}][wm]overlay=W-w-24:24[vwm]`);
+        last = "vwm";
+        nextInput += 1;
+      }
+      captions.forEach((cue, index) => {
+        const src = `cap${index}`;
+        const out = `vo${index}`;
+        filters.push(`[${nextInput}:v]scale=min(720\\,iw):-1[${src}]`);
+        filters.push(
+          `[${last}][${src}]overlay=(W-w)/2:H-h-48:enable='between(t,${cue.start.toFixed(2)},${cue.end.toFixed(2)})'[${out}]`,
+        );
+        last = out;
+        nextInput += 1;
+      });
+      args.push(
+        "-filter_complex",
+        filters.join(";"),
+        "-map",
+        `[${last}]`,
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "26",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        output,
+      );
+    }
+
     const code = await ffmpeg.exec(args);
-    ffmpeg.off("progress", handler);
     if (code !== 0) {
       throw new Error("FFmpeg não conseguiu gerar esse corte.");
     }
     const data = (await ffmpeg.readFile(output)) as Uint8Array;
-    await ffmpeg.deleteFile(output).catch(() => undefined);
     return new Blob([data.slice() as unknown as BlobPart], { type: "video/mp4" });
   } finally {
     ffmpeg.off("progress", handler);
     await ffmpeg.deleteFile(output).catch(() => undefined);
+    for (const name of extras) await ffmpeg.deleteFile(name).catch(() => undefined);
     await input.close();
   }
 }

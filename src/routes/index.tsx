@@ -5,7 +5,9 @@ import {
   Download,
   FileText,
   Film,
+  ImagePlus,
   Loader2,
+  Play,
   ShieldAlert,
   Sparkles,
   Upload,
@@ -15,13 +17,21 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Toaster } from "@/components/ui/sonner";
 import {
+  captionsForClip,
   CATEGORY_LABEL,
+  CLIP_LENGTH_OPTIONS,
+  clipBoundsForLength,
+  clipKey,
+  DEFAULT_CLIP_LENGTH,
   finalizeClips,
   formatBytes,
   formatClock,
@@ -35,6 +45,8 @@ import {
   sampleTranscript,
   selectCandidatesForAnalysis,
   type Clip,
+  type ClipLength,
+  type TranscriptSegment,
   type TranscriptionResult,
 } from "@/lib/clip-engine";
 import {
@@ -62,7 +74,7 @@ export const Route = createFileRoute("/")({
       {
         property: "og:description",
         content:
-          "Transcrição, roteiro extraído da fala e cortes de 15 a 90 segundos por categoria, direto no navegador.",
+          "Transcrição, preview no navegador e cortes de 30s a 3 min por categoria, direto no navegador.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -163,7 +175,9 @@ function Index() {
   const [progress, setProgress] = useState(0);
   const [overview, setOverview] = useState("");
   const [clips, setClips] = useState<Clip[]>([]);
+  const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [targetCount, setTargetCount] = useState(8);
+  const [clipLength, setClipLength] = useState<ClipLength>(DEFAULT_CLIP_LENGTH);
   const [rendering, setRendering] = useState<number | null>(null);
   const [renderProgress, setRenderProgress] = useState(0);
   const [scriptName, setScriptName] = useState("");
@@ -172,9 +186,21 @@ function Index() {
   const [filmTitle, setFilmTitle] = useState("");
   const [extractedScenes, setExtractedScenes] = useState<ScreenplayScene[]>([]);
   const [categoryFilter, setCategoryFilter] = useState<string>(ALL_CATEGORIES);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [previewing, setPreviewing] = useState<string | null>(null);
+  const [burnCaptions, setBurnCaptions] = useState(false);
+  const [watermark, setWatermark] = useState<File | null>(null);
   const [batching, setBatching] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const scriptRef = useRef<HTMLInputElement>(null);
+  const watermarkRef = useRef<HTMLInputElement>(null);
+  const sourceUrl = useMemo(() => (file ? URL.createObjectURL(file) : ""), [file]);
+
+  useEffect(() => {
+    return () => {
+      if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+    };
+  }, [sourceUrl]);
 
   const busy = stage !== "idle" && stage !== "done";
   const grouped = useMemo(() => groupClipsByCategory(clips), [clips]);
@@ -182,6 +208,10 @@ function Index() {
     if (categoryFilter === ALL_CATEGORIES) return clips;
     return clips.filter((clip) => clip.category === categoryFilter);
   }, [clips, categoryFilter]);
+  const selectedClips = useMemo(
+    () => visibleClips.filter((clip) => selected.has(clipKey(clip))),
+    [visibleClips, selected],
+  );
 
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
@@ -196,6 +226,9 @@ function Index() {
 
   const pickFile = useCallback(async (picked: File) => {
     setClips([]);
+    setSegments([]);
+    setSelected(new Set());
+    setPreviewing(null);
     setOverview("");
     setStage("idle");
     setProgress(0);
@@ -314,8 +347,9 @@ function Index() {
       setExtractedScenes(fromSpeechScenes.scenes);
       const sourceScenes = scriptScenes.length ? scriptScenes : fromSpeechScenes.scenes;
       const alignedScenes = alignScreenplayToTranscript(sourceScenes, segments, duration);
-      const fromSpeech = generateClipCandidates(segments, duration);
-      const fromScript = candidatesFromScreenplay(alignedScenes, duration);
+      const bounds = clipBoundsForLength(clipLength);
+      const fromSpeech = generateClipCandidates(segments, duration, bounds);
+      const fromScript = candidatesFromScreenplay(alignedScenes, duration, clipLength);
       const pool = mergeCandidatePools(fromScript, fromSpeech);
       const candidates = selectCandidatesForAnalysis(pool, targetCount);
       console.info("[clip-engine]", {
@@ -359,6 +393,7 @@ function Index() {
         body: JSON.stringify({
           duration,
           targetCount,
+          clipLength,
           filmTitle: filmTitle.trim(),
           segments: sampleTranscript(segments, 400),
           candidates: candidates.map((candidate) => ({
@@ -392,9 +427,11 @@ function Index() {
         });
         throw new AnalysisError("analyzing", info.error || "A análise falhou.");
       }
-      const valid = finalizeClips(info.clips || [], candidates, duration, targetCount);
+      const valid = finalizeClips(info.clips || [], candidates, duration, targetCount, clipLength);
       setOverview(info.overview || "");
       setClips(valid);
+      setSegments(segments);
+      setSelected(new Set(valid.map((clip) => clipKey(clip))));
       setCategoryFilter(ALL_CATEGORIES);
       setStage("done");
       toast.success(`${valid.length} cortes prontos, agrupados por cena.`);
@@ -414,7 +451,7 @@ function Index() {
         },
       );
     }
-  }, [duration, file, filmTitle, scriptScenes, scriptText, targetCount]);
+  }, [clipLength, duration, file, filmTitle, scriptScenes, scriptText, targetCount]);
 
   const saveBlob = (blob: Blob, name: string) => {
     const url = URL.createObjectURL(blob);
@@ -431,15 +468,26 @@ function Index() {
     return `${cat}-${slug}${vertical ? "-9x16" : ""}.mp4`;
   };
 
+  const exportOptions = useCallback(
+    (clip: Clip) => ({
+      vertical: false,
+      captions: burnCaptions ? captionsForClip(segments, clip.start, clip.end) : [],
+      watermark,
+    }),
+    [burnCaptions, segments, watermark],
+  );
+
   const download = useCallback(
     async (clip: Clip, index: number, vertical: boolean) => {
       if (!file) return;
       setRendering(index);
       setRenderProgress(0);
       try {
-        const blob = await cutClip(file, clip.start, clip.end, vertical, (r) =>
-          setRenderProgress(Math.round(r * 100)),
-        );
+        const blob = await cutClip(file, clip.start, clip.end, {
+          ...exportOptions(clip),
+          vertical,
+          onProgress: (r) => setRenderProgress(Math.round(r * 100)),
+        });
         saveBlob(blob, fileNameFor(clip, vertical));
       } catch {
         toast.error("Não foi possível gerar esse corte.");
@@ -447,25 +495,28 @@ function Index() {
         setRendering(null);
       }
     },
-    [file],
+    [exportOptions, file],
   );
 
-  const downloadVisible = useCallback(
+  const downloadSelected = useCallback(
     async (vertical: boolean) => {
-      if (!file || !visibleClips.length) return;
+      const list = selectedClips.length ? selectedClips : visibleClips;
+      if (!file || !list.length) return;
       setBatching(true);
       try {
-        for (let i = 0; i < visibleClips.length; i++) {
-          const clip = visibleClips[i];
+        for (let i = 0; i < list.length; i++) {
+          const clip = list[i];
           if (!clip) continue;
           setRendering(i);
           setRenderProgress(0);
-          const blob = await cutClip(file, clip.start, clip.end, vertical, (r) =>
-            setRenderProgress(Math.round(r * 100)),
-          );
+          const blob = await cutClip(file, clip.start, clip.end, {
+            ...exportOptions(clip),
+            vertical,
+            onProgress: (r) => setRenderProgress(Math.round(r * 100)),
+          });
           saveBlob(blob, fileNameFor(clip, vertical));
         }
-        toast.success(`${visibleClips.length} cortes baixados.`);
+        toast.success(`${list.length} cortes baixados.`);
       } catch {
         toast.error("A geração em lote parou em um dos cortes.");
       } finally {
@@ -473,8 +524,18 @@ function Index() {
         setRendering(null);
       }
     },
-    [file, visibleClips],
+    [exportOptions, file, selectedClips, visibleClips],
   );
+
+  const toggleClip = (clip: Clip, checked: boolean) => {
+    const key = clipKey(clip);
+    setSelected((current) => {
+      const next = new Set(current);
+      if (checked) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  };
 
   const stageLabel = useMemo(
     () =>
@@ -547,6 +608,9 @@ function Index() {
                   onClick={() => {
                     setFile(null);
                     setClips([]);
+                    setSegments([]);
+                    setSelected(new Set());
+                    setPreviewing(null);
                     setOverview("");
                     setCategoryFilter(ALL_CATEGORIES);
                     setExtractedScenes([]);
@@ -618,6 +682,24 @@ function Index() {
                 </div>
               </div>
 
+              <div className="grid gap-2">
+                <span className="text-sm text-muted-foreground">Duração de cada corte</span>
+                <div className="flex flex-wrap gap-2">
+                  {CLIP_LENGTH_OPTIONS.map((option) => (
+                    <Button
+                      key={option.seconds}
+                      type="button"
+                      size="sm"
+                      variant={clipLength === option.seconds ? "default" : "outline"}
+                      disabled={busy}
+                      onClick={() => setClipLength(option.seconds)}
+                    >
+                      {option.label}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+
               <div className="grid gap-3">
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-muted-foreground">Quantidade de cortes desejada</span>
@@ -683,6 +765,17 @@ function Index() {
               e.target.value = "";
             }}
           />
+          <input
+            ref={watermarkRef}
+            type="file"
+            accept="image/png"
+            hidden
+            onChange={(e) => {
+              const picked = e.target.files?.[0];
+              if (picked) setWatermark(picked);
+              e.target.value = "";
+            }}
+          />
         </section>
 
         {overview && (
@@ -703,25 +796,72 @@ function Index() {
                 <Button
                   variant="outline"
                   size="sm"
-                  disabled={batching || rendering !== null || !visibleClips.length}
-                  onClick={() => void downloadVisible(false)}
+                  disabled={!visibleClips.length}
+                  onClick={() => setSelected(new Set(visibleClips.map((clip) => clipKey(clip))))}
+                >
+                  Selecionar visíveis
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={!selected.size}
+                  onClick={() => setSelected(new Set())}
+                >
+                  Limpar seleção
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={batching || rendering !== null || !selectedClips.length}
+                  onClick={() => void downloadSelected(false)}
                 >
                   {batching ? (
                     <Loader2 className="size-4 animate-spin" />
                   ) : (
                     <Download className="size-4" />
                   )}
-                  Baixar visíveis
+                  Baixar {selectedClips.length || 0} selecionados
                 </Button>
                 <Button
                   size="sm"
-                  disabled={batching || rendering !== null || !visibleClips.length}
-                  onClick={() => void downloadVisible(true)}
+                  disabled={batching || rendering !== null || !selectedClips.length}
+                  onClick={() => void downloadSelected(true)}
                 >
-                  Baixar visíveis 9:16
+                  Baixar selecionados 9:16
                 </Button>
               </div>
             </div>
+
+            <div className="flex flex-wrap items-center gap-4 rounded-2xl border border-border bg-card/50 p-4">
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="burn-captions"
+                  checked={burnCaptions}
+                  onCheckedChange={setBurnCaptions}
+                />
+                <Label htmlFor="burn-captions">Colocar legenda no vídeo</Label>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => watermarkRef.current?.click()}
+                >
+                  <ImagePlus className="size-4" />
+                  {watermark ? watermark.name : "Marca d'água PNG"}
+                </Button>
+                {watermark ? (
+                  <Button variant="ghost" size="sm" onClick={() => setWatermark(null)}>
+                    <X className="size-4" /> Remover
+                  </Button>
+                ) : null}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Preview no navegador. Legenda e marca d'água entram só no arquivo baixado.
+              </p>
+            </div>
+
             <Tabs value={categoryFilter} onValueChange={setCategoryFilter}>
               <TabsList className="flex h-auto w-full flex-wrap justify-start gap-1">
                 <TabsTrigger value={ALL_CATEGORIES}>Todas ({clips.length})</TabsTrigger>
@@ -732,54 +872,89 @@ function Index() {
                 ))}
               </TabsList>
             </Tabs>
-            {visibleClips.map((clip, index) => (
-              <article
-                key={`${clip.start}-${clip.category}-${index}`}
-                className="rounded-2xl border border-border bg-card/70 p-5 transition-colors hover:border-primary/40"
-              >
-                <div className="flex flex-wrap items-start justify-between gap-4">
-                  <div className="max-w-2xl">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Badge className="bg-primary/15 text-primary hover:bg-primary/20">
-                        {CATEGORY_LABEL[normalizeCategory(clip.category)]}
-                      </Badge>
-                      <span className="text-sm text-muted-foreground">
-                        {formatTime(clip.start)} → {formatTime(clip.end)} ·{" "}
-                        {Math.round(clip.end - clip.start)}s
-                      </span>
-                      <span className="text-sm font-medium text-primary">{clip.score}/100</span>
+            {visibleClips.map((clip, index) => {
+              const key = clipKey(clip);
+              const checked = selected.has(key);
+              const open = previewing === key;
+              return (
+                <article
+                  key={key}
+                  className="rounded-2xl border border-border bg-card/70 p-5 transition-colors hover:border-primary/40"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div className="flex max-w-2xl items-start gap-3">
+                      <Checkbox
+                        checked={checked}
+                        onCheckedChange={(value) => toggleClip(clip, value === true)}
+                        aria-label={`Selecionar ${clip.title}`}
+                        className="mt-1"
+                      />
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Badge className="bg-primary/15 text-primary hover:bg-primary/20">
+                            {CATEGORY_LABEL[normalizeCategory(clip.category)]}
+                          </Badge>
+                          <span className="text-sm text-muted-foreground">
+                            {formatTime(clip.start)} → {formatTime(clip.end)} ·{" "}
+                            {Math.round(clip.end - clip.start)}s
+                          </span>
+                          <span className="text-sm font-medium text-primary">{clip.score}/100</span>
+                        </div>
+                        <h3 className="mt-3 font-display text-lg">{clip.title}</h3>
+                        {clip.hook && (
+                          <p className="mt-1 text-sm italic text-muted-foreground">“{clip.hook}”</p>
+                        )}
+                        <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
+                          {clip.reason}
+                        </p>
+                      </div>
                     </div>
-                    <h3 className="mt-3 font-display text-lg">{clip.title}</h3>
-                    {clip.hook && (
-                      <p className="mt-1 text-sm italic text-muted-foreground">“{clip.hook}”</p>
-                    )}
-                    <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-                      {clip.reason}
-                    </p>
+                    <div className="flex flex-col gap-2">
+                      <Button variant="secondary" onClick={() => setPreviewing(open ? null : key)}>
+                        <Play className="size-4" />
+                        {open ? "Fechar preview" : "Pré-visualizar"}
+                      </Button>
+                      <Button
+                        onClick={() => void download(clip, index, true)}
+                        disabled={rendering !== null || batching}
+                      >
+                        {rendering === index ? (
+                          <Loader2 className="size-4 animate-spin" />
+                        ) : (
+                          <Download className="size-4" />
+                        )}
+                        {rendering === index ? `${renderProgress}%` : "Baixar 9:16"}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        onClick={() => void download(clip, index, false)}
+                        disabled={rendering !== null || batching}
+                      >
+                        Baixar original
+                      </Button>
+                    </div>
                   </div>
-                  <div className="flex flex-col gap-2">
-                    <Button
-                      onClick={() => void download(clip, index, true)}
-                      disabled={rendering !== null || batching}
-                    >
-                      {rendering === index ? (
-                        <Loader2 className="size-4 animate-spin" />
-                      ) : (
-                        <Download className="size-4" />
-                      )}
-                      {rendering === index ? `${renderProgress}%` : "Baixar 9:16"}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      onClick={() => void download(clip, index, false)}
-                      disabled={rendering !== null || batching}
-                    >
-                      Baixar original
-                    </Button>
-                  </div>
-                </div>
-              </article>
-            ))}
+                  {open && sourceUrl ? (
+                    <video
+                      className="mt-4 w-full rounded-xl bg-black"
+                      src={sourceUrl}
+                      controls
+                      playsInline
+                      preload="metadata"
+                      onLoadedMetadata={(event) => {
+                        event.currentTarget.currentTime = clip.start;
+                      }}
+                      onTimeUpdate={(event) => {
+                        if (event.currentTarget.currentTime >= clip.end - 0.05) {
+                          event.currentTarget.pause();
+                          event.currentTarget.currentTime = clip.start;
+                        }
+                      }}
+                    />
+                  ) : null}
+                </article>
+              );
+            })}
             <p className="text-center text-xs text-muted-foreground">
               Baixe antes de fechar ou atualizar: os cortes existem somente nesta sessão.
             </p>

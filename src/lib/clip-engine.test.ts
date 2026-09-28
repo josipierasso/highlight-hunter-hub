@@ -8,6 +8,8 @@ import {
   finalizeClips,
   formatBytes,
   formatClock,
+  captionsForClip,
+  fitClipToLength,
   generateClipCandidates,
   groupClipsByCategory,
   intervalIoU,
@@ -182,13 +184,26 @@ describe("candidates", () => {
   ];
 
   it("keeps candidates between 15s and 90s", () => {
-    const candidates = generateClipCandidates(story, 200);
+    const candidates = generateClipCandidates(story, 200, { minSeconds: 15, maxSeconds: 90 });
     assert.ok(candidates.length > 0);
     for (const candidate of candidates) {
       const duration = candidate.end - candidate.start;
       assert.ok(duration >= MIN_CLIP_SECONDS - 0.01);
-      assert.ok(duration <= MAX_CLIP_SECONDS + 0.01);
+      assert.ok(duration <= 90.01);
     }
+  });
+
+  it("fits a clip to a fixed length", () => {
+    const fitted = fitClipToLength({ start: 10, end: 22 }, 30, 80);
+    assert.equal(fitted.start, 10);
+    assert.equal(fitted.end, 40);
+  });
+
+  it("builds captions relative to the clip start", () => {
+    const cues = captionsForClip(story, 10, 24);
+    assert.ok(cues.length >= 1);
+    assert.equal(cues[0]?.start, 0);
+    assert.ok((cues[0]?.end ?? 0) > 0);
   });
 
   it("starts candidates on sentence boundaries, not mid-phrase", () => {

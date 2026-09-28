@@ -235,7 +235,9 @@ export function alignScreenplayToTranscript(
 export function candidatesFromScreenplay(
   scenes: ScreenplayScene[],
   duration: number,
+  clipLength = 90,
 ): ClipCandidate[] {
+  const target = Math.min(180, Math.max(15, clipLength));
   const candidates: ClipCandidate[] = [];
   for (const scene of scenes) {
     if (scene.start == null || scene.end == null) continue;
@@ -255,14 +257,15 @@ export function candidatesFromScreenplay(
         heading: scene.heading,
       });
     };
-    if (span <= 90) {
-      push(start, end);
+    if (span <= target + 8) {
+      push(start, Math.min(end, start + target));
       continue;
     }
-    const window = 45;
-    for (let from = start; from < end - 12; from += 30) {
+    const window = target;
+    const step = Math.max(12, Math.round(target * 0.7));
+    for (let from = start; from < end - 8; from += step) {
       const to = Math.min(end, from + window);
-      if (to - from >= 15) push(from, to);
+      if (to - from >= 8) push(from, to);
     }
   }
   return candidates;

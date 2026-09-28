@@ -110,7 +110,16 @@ export type Clip = {
 };
 
 export const MIN_CLIP_SECONDS = 15;
-export const MAX_CLIP_SECONDS = 90;
+export const MAX_CLIP_SECONDS = 180;
+export const CLIP_LENGTH_OPTIONS = [
+  { seconds: 30, label: "30s" },
+  { seconds: 50, label: "50s" },
+  { seconds: 60, label: "1 min" },
+  { seconds: 120, label: "2 min" },
+  { seconds: 180, label: "3 min" },
+] as const;
+export type ClipLength = (typeof CLIP_LENGTH_OPTIONS)[number]["seconds"];
+export const DEFAULT_CLIP_LENGTH: ClipLength = 30;
 export const MAX_CANDIDATES_FOR_LLM = 36;
 export const MAX_VIDEO_SECONDS = 2 * 60 * 60;
 export const MAX_RESULT_CLIPS = 40;
@@ -436,6 +445,80 @@ export function cheapCandidateScore(candidate: ClipCandidate) {
   return sweet * 40 + density * 30 + (words / 90) * 20 + punch * 10 + scriptBoost;
 }
 
+export function clipBoundsForLength(length: number) {
+  const target = Math.min(MAX_CLIP_SECONDS, Math.max(MIN_CLIP_SECONDS, length));
+  return {
+    minSeconds: Math.max(8, target * 0.55),
+    maxSeconds: Math.min(MAX_CLIP_SECONDS, target + 8),
+  };
+}
+
+export function fitClipToLength(
+  clip: { start: number; end: number },
+  length: number,
+  duration: number,
+) {
+  const target = Math.min(MAX_CLIP_SECONDS, Math.max(8, length));
+  const limit = duration > 0 ? duration : clip.end + target;
+  let start = Math.max(0, clip.start);
+  let end = start + target;
+  if (end > limit) {
+    end = limit;
+    start = Math.max(0, end - target);
+  }
+  if (end - start < 3) {
+    start = Math.max(0, clip.start);
+    end = Math.min(limit, start + Math.max(3, clip.end - clip.start));
+  }
+  return { start: roundTime(start), end: roundTime(end) };
+}
+
+export function wrapCaption(text: string, maxChars = 32) {
+  const words = text.replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
+  const lines: string[] = [];
+  let current = "";
+  for (const word of words) {
+    const next = current ? `${current} ${word}` : word;
+    if (next.length > maxChars && current) {
+      lines.push(current);
+      current = word;
+      if (lines.length === 2) {
+        const rest = words.slice(words.indexOf(word)).join(" ");
+        lines.push(rest.length > maxChars ? `${rest.slice(0, maxChars - 1)}…` : rest);
+        return lines.slice(0, 3);
+      }
+    } else {
+      current = next;
+    }
+  }
+  if (current) lines.push(current);
+  return lines.slice(0, 3);
+}
+
+export function captionsForClip(
+  segments: TranscriptSegment[],
+  start: number,
+  end: number,
+): TranscriptSegment[] {
+  const cues: TranscriptSegment[] = [];
+  for (const segment of segments) {
+    const from = Math.max(segment.start, start);
+    const to = Math.min(segment.end, end);
+    const text = segment.text.trim();
+    if (!text || to - from < 0.18) continue;
+    cues.push({
+      start: roundTime(from - start),
+      end: roundTime(to - start),
+      text,
+    });
+  }
+  return cues;
+}
+
+export function clipKey(clip: { start: number; end: number; title?: string }) {
+  return `${clip.start.toFixed(2)}:${clip.end.toFixed(2)}:${clip.title ?? ""}`;
+}
+
 export function generateClipCandidates(
   segments: TranscriptSegment[],
   duration: number,
@@ -614,14 +697,18 @@ export function finalizeClips(
   candidates: ClipCandidate[],
   duration: number,
   targetCount: number,
+  clipLength?: number,
 ): Clip[] {
   const prepared: Clip[] = [];
+  const bounds = clipBoundsForLength(clipLength ?? MAX_CLIP_SECONDS);
   for (const clip of clips) {
     const snapped = snapClipToCandidates(clip, candidates);
-    const start = roundTime(clamp(snapped.start, 0, duration || snapped.end));
-    const end = roundTime(clamp(snapped.end, start, duration || snapped.end));
+    const fitted = clipLength ? fitClipToLength(snapped, clipLength, duration) : snapped;
+    const start = roundTime(clamp(fitted.start, 0, duration || fitted.end));
+    const end = roundTime(clamp(fitted.end, start, duration || fitted.end));
     const length = end - start;
-    const minLen = duration > 0 && duration < MIN_CLIP_SECONDS ? 3 : MIN_CLIP_SECONDS - 0.5;
+    const minLen =
+      duration > 0 && duration < MIN_CLIP_SECONDS ? 3 : Math.min(8, bounds.minSeconds) - 0.5;
     if (length < minLen || length > MAX_CLIP_SECONDS + 0.5) continue;
     const scores = normalizeScores(clip.scores, clip.score);
     const score = clip.scores ? computeOverallScore(scores) : clamp(clip.score, 0, 100);
